@@ -21,6 +21,24 @@ curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-
 5. 安装完成**同时输出** `mierus://` 节点链接、客户端 JSON、**Clash/mihomo 片段**及连接信息摘要
 6. 下载包 **SHA256 校验**；提示云安全组放行端口
 
+### v1.2.7 修复
+
+- 交互安装增加 **编号菜单** 选择传输协议（1=TCP / 2=UDP / 3=双协议），置于端口询问之前
+- 修复 v1.2.4 默认 TCP 时跳过协议询问的 BUG
+
+### v1.2.6 增强
+
+- **分协议输出**：双协议（BOTH）时分别输出 TCP / UDP 节点链接与 JSON（`mieru_client_tcp_*.json`、`mieru_client_udp_*.json`）
+- 单协议（TCP 或 UDP）时仅输出对应链接与配置
+- Clash 片段：双协议输出 tcp / udp 两条独立代理（不再聚合为单条）
+
+### v1.2.5 修复
+
+- 修复双协议（BOTH）被误判为 TCP，导致卸载时 UDP 防火墙规则未清理
+- 修复交互安装时无法选择 UDP/双协议（默认 TCP 跳过协议询问）
+- `--client-config` / 卸载防火墙：从 `mita describe config` 精确解析 portBindings
+- 移除未使用的 `--menu` 参数
+
 ### v1.2.4 修复
 
 - **默认改回 TCP**（官方推荐；多数场景 Clash `udp: true` 即够用）

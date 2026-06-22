@@ -3,7 +3,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.4"
+SCRIPT_VERSION="1.2.7"
 UPSTREAM_REPO="enfein/mieru"
 GITHUB_API="https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"
 GITHUB_DL="https://github.com/${UPSTREAM_REPO}/releases/download"
@@ -25,6 +25,7 @@ STAGE="初始化"
 PORT=""
 PORT_RANGE=""
 PROTOCOL="TCP"
+PROTOCOL_CLI=0
 USERNAME=""
 PASSWORD=""
 OP_USER=""
@@ -106,7 +107,6 @@ while [ $# -gt 0 ]; do
     --uninstall) ACTION=uninstall ;;
     --status) ACTION=status ;;
     --client-config) ACTION=client-config ;;
-    --menu) ACTION=menu ;;
     --yes|-y) YES=1 ;;
     --dry-run) DRY_RUN=1 ;;
     --port)
@@ -121,6 +121,7 @@ while [ $# -gt 0 ]; do
       ;;
     --protocol)
       PROTOCOL="${2:-}"
+      PROTOCOL_CLI=1
       shift
       ;;
     --user)
@@ -653,6 +654,29 @@ valid_port_range() {
   valid_port "$start" && valid_port "$end" && [ "$start" -le "$end" ]
 }
 
+choose_protocol_interactive() {
+  msg ""
+  t '传输协议:' 'Transport protocol:'
+  t '  1) TCP（推荐；Clash 设 udp: true 即可）' \
+    '  1) TCP (recommended; Clash udp: true is enough)'
+  t '  2) UDP' '  2) UDP'
+  t '  3) TCP + UDP 双协议（UDP 端口 = TCP 端口 + 1）' \
+    '  3) TCP + UDP dual (UDP port = TCP port + 1)'
+  msg ""
+  local choice=""
+  read_tty choice "$(t '请选择协议 [1-3，默认 1]: ' 'Choose protocol [1-3, default 1]: ')" || choice="1"
+  choice="${choice:-1}"
+  case "$choice" in
+    1|TCP|tcp) PROTOCOL="TCP" ;;
+    2|UDP|udp) PROTOCOL="UDP" ;;
+    3|BOTH|both|双协议) PROTOCOL="BOTH" ;;
+    *)
+      warn "$(t "无效选择「${choice}」，使用默认 TCP" "Invalid choice \"${choice}\", using TCP")"
+      PROTOCOL="TCP"
+      ;;
+  esac
+}
+
 collect_config_interactive() {
   STAGE="交互配置"
   [ -n "$USERNAME" ] || USERNAME="$(random_token)"
@@ -662,11 +686,18 @@ collect_config_interactive() {
     'Proxy credentials auto-generated (shown again after install):'
   t "  用户名: ${USERNAME}" "  Username: ${USERNAME}"
   t "  密码:   ${PASSWORD}" "  Password: ${PASSWORD}"
-  msg ""
 
+  if [ "$PROTOCOL_CLI" -eq 0 ]; then
+    choose_protocol_interactive
+  fi
+
+  msg ""
   if [ -z "$PORT" ] && [ -z "$PORT_RANGE" ]; then
     local default_port input=""
     default_port="$(random_port)"
+    if [ "$PROTOCOL" = "BOTH" ] && [ "$default_port" -ge 65535 ]; then
+      default_port=65534
+    fi
     read_tty input "$(t "监听端口 [${default_port}]: " "Listen port [${default_port}]: ")" || input=""
     PORT="${input:-$default_port}"
     valid_port "$PORT" || die "$(t '非法端口' 'Invalid port')"
@@ -674,15 +705,12 @@ collect_config_interactive() {
     die "$(t '不能同时指定端口与端口段' 'Cannot set both port and port range')"
   fi
 
-  if [ "$PROTOCOL" != "TCP" ] && [ "$PROTOCOL" != "UDP" ]; then
-    read_tty PROTOCOL "$(t '协议 TCP/UDP/双协议 [TCP]: ' 'Protocol TCP/UDP/BOTH [TCP]: ')" || PROTOCOL="TCP"
-    PROTOCOL="${PROTOCOL:-TCP}"
-    PROTOCOL="$(normalize_protocol "$PROTOCOL" || echo TCP)"
-  fi
   if [ "$PROTOCOL" = "BOTH" ] && [ -n "$PORT" ] && [ "$PORT" -ge 65535 ]; then
     die "$(t '双协议需要主端口 ≤65534（UDP 使用主端口+1）' \
       'Dual protocol needs main port ≤65534 (UDP uses main port + 1)')"
   fi
+  msg ""
+  t "已选协议: $(protocol_label)" "Selected protocol: $(protocol_label)"
 }
 
 ensure_config_noninteractive() {
@@ -767,25 +795,107 @@ apply_config() {
 }
 
 collect_ports_from_mita() {
+  local saved_protocol="" saved_port="" saved_port_range=""
+  if [ -f "$MITA_STATE" ]; then
+    # shellcheck disable=SC1090
+    source "$MITA_STATE" 2>/dev/null || true
+    saved_protocol="$PROTOCOL"
+    saved_port="$PORT"
+    saved_port_range="$PORT_RANGE"
+  else
+    PORT=""
+    PORT_RANGE=""
+    PROTOCOL="TCP"
+  fi
+
   local desc bin
   bin="$(mita_bin)"
   desc="$("$bin" describe config 2>/dev/null || true)"
   if [ -z "$desc" ]; then
-    load_install_state
+    if [ -n "$saved_protocol" ]; then
+      PROTOCOL="$saved_protocol"
+      PORT="$saved_port"
+      PORT_RANGE="$saved_port_range"
+    fi
     return 0
   fi
+
   PORT="$(printf '%s' "$desc" | sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
   PORT_RANGE="$(printf '%s' "$desc" | sed -n 's/.*"portRange"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
   local tcp_count udp_count
   tcp_count="$(printf '%s' "$desc" | grep -c '"protocol"[[:space:]]*:[[:space:]]*"TCP"' || true)"
   udp_count="$(printf '%s' "$desc" | grep -c '"protocol"[[:space:]]*:[[:space:]]*"UDP"' || true)"
-  if [ "$tcp_count" -gt 0 ] && [ "$udp_count" -gt 0 ]; then
-    PROTOCOL="TCP"
+  if [ -n "$saved_protocol" ]; then
+    PROTOCOL="$saved_protocol"
+  elif [ "$tcp_count" -gt 0 ] && [ "$udp_count" -gt 0 ]; then
+    PROTOCOL="BOTH"
   elif [ "$udp_count" -gt 0 ]; then
     PROTOCOL="UDP"
   else
     PROTOCOL="TCP"
   fi
+}
+
+# 从 mita describe config 输出解析 portBindings，每行 proto|port_or_range
+extract_bindings_from_describe() {
+  local desc="$1"
+  [ -n "$desc" ] || return 0
+  if command -v python3 >/dev/null 2>&1; then
+    printf '%s' "$desc" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(0)
+for binding in data.get("portBindings", []):
+    proto = binding.get("protocol", "TCP")
+    if "port" in binding:
+        print(f"{proto}|{binding['port']}")
+    elif binding.get("portRange"):
+        print(f"{proto}|{binding['portRange']}")
+' 2>/dev/null || true
+    return 0
+  fi
+  local line proto p
+  while IFS= read -r line; do
+    proto="$(printf '%s' "$line" | sed -n 's/.*"protocol"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    p="$(printf '%s' "$line" | sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p')"
+    [ -z "$p" ] && p="$(printf '%s' "$line" | sed -n 's/.*"portRange"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p')"
+    [ -n "$proto" ] && [ -n "$p" ] && printf '%s|%s\n' "$proto" "$p"
+  done < <(printf '%s' "$desc" | grep -E '"port"|"portRange"|"protocol"')
+}
+
+close_firewall_for_bindings() {
+  local bindings="$1"
+  local fw="" pp proto p proto_lc
+  [ -n "$bindings" ] || return 0
+
+  if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
+    fw=ufw
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+    fw=firewalld
+  elif command -v iptables >/dev/null 2>&1; then
+    fw=iptables
+  else
+    return 0
+  fi
+
+  while IFS= read -r pp; do
+    [ -n "$pp" ] || continue
+    proto="${pp%%|*}"
+    p="${pp#*|}"
+    proto_lc="$(proto_lower "$proto")"
+    case "$fw" in
+      ufw) run ufw delete allow "$(ufw_rule_spec "$p" "$proto_lc")" 2>/dev/null || true ;;
+      firewalld) run firewall-cmd --permanent --remove-port="${p}/${proto_lc}" 2>/dev/null || true ;;
+      iptables) iptables_accept_port "$p" "$proto_lc" del ;;
+    esac
+  done <<< "$bindings"
+
+  case "$fw" in
+    firewalld) run firewall-cmd --reload 2>/dev/null || true ;;
+    iptables) persist_iptables_rules ;;
+  esac
 }
 
 ufw_rule_spec() {
@@ -873,6 +983,14 @@ open_firewall() {
 
 close_firewall() {
   STAGE="清理防火墙规则"
+  local desc bindings bin
+  bin="$(mita_bin)"
+  desc="$("$bin" describe config 2>/dev/null || true)"
+  bindings="$(extract_bindings_from_describe "$desc")"
+  if [ -n "$bindings" ]; then
+    close_firewall_for_bindings "$bindings"
+    return 0
+  fi
   collect_ports_from_mita
   local pp proto p proto_lc fw=""
   if ! pp="$(port_protocol_pairs | head -n1)" || [ -z "$pp" ]; then
@@ -1013,61 +1131,92 @@ urlencode() {
     'python3 required to encode special characters in share link')"
 }
 
-generate_share_link() {
+generate_share_link_for() {
   local ip="$1"
-  local enc_user enc_pass query pp proto p host
+  local proto="$2"
+  local enc_user enc_pass p host query
   enc_user="$(urlencode "$USERNAME")"
   enc_pass="$(urlencode "$PASSWORD")"
-  query="handshake-mode=HANDSHAKE_STANDARD&mtu=${MTU}&multiplexing=${MULTIPLEXING}"
-  while IFS= read -r pp; do
-    p="${pp#*|}"
-    query="${query}&port=${p}"
-  done < <(port_protocol_pairs)
-  query="${query}&profile=default"
-  while IFS= read -r pp; do
-    proto="${pp%%|*}"
-    query="${query}&protocol=${proto}"
-  done < <(port_protocol_pairs)
-  host="$ip"
+  p="$(port_for_protocol "$proto")"
+  query="handshake-mode=HANDSHAKE_STANDARD&mtu=${MTU}&multiplexing=${MULTIPLEXING}&port=${p}&profile=default&protocol=${proto}"
   if [ -n "$PORT" ]; then
-    host="${ip}:${PORT}"
+    host="${ip}:${p}"
+  else
+    host="$ip"
   fi
   printf 'mierus://%s:%s@%s?%s' "$enc_user" "$enc_pass" "$host" "$query"
 }
 
-build_clash_yaml() {
+build_client_json_for() {
   local ip="$1"
-  local pp proto p port_lines name_suffix
-  if [ "$PROTOCOL" = "BOTH" ]; then
-    p="$(port_for_protocol TCP)"
-    if [ -n "$PORT" ]; then
-      port_lines="    port: ${p}"
-    else
-      port_lines="    port-range: ${p}"
-    fi
-    cat <<EOF
-  - name: mieru-mita
-    type: mieru
-    server: ${ip}
-${port_lines}
-    transport: TCP
-    udp: true
-    username: ${USERNAME}
-    password: ${PASSWORD}
-    multiplexing: ${MULTIPLEXING}
-EOF
-    return 0
+  local proto="$2"
+  local p binding
+  p="$(port_for_protocol "$proto")"
+  if [ -n "$PORT" ]; then
+    binding=$(cat <<EOB
+            {
+              "port": ${p},
+              "protocol": "${proto}"
+            }
+EOB
+)
+  else
+    binding=$(cat <<EOB
+            {
+              "portRange": "${p}",
+              "protocol": "${proto}"
+            }
+EOB
+)
   fi
-  while IFS= read -r pp; do
-    proto="${pp%%|*}"
-    p="${pp#*|}"
-    name_suffix="$(proto_lower "$proto")"
-    if [ -n "$PORT" ]; then
-      port_lines="    port: ${p}"
-    else
-      port_lines="    port-range: ${p}"
-    fi
-    cat <<EOF
+  cat <<EOF
+{
+  "profiles": [
+    {
+      "profileName": "default",
+      "user": {
+        "name": "${USERNAME}",
+        "password": "${PASSWORD}"
+      },
+      "servers": [
+        {
+          "ipAddress": "${ip}",
+          "domainName": "",
+          "portBindings": [
+${binding}
+          ]
+        }
+      ],
+      "mtu": ${MTU},
+      "multiplexing": {
+        "level": "${MULTIPLEXING}"
+      },
+      "handshakeMode": "HANDSHAKE_STANDARD"
+    }
+  ],
+  "activeProfile": "default",
+  "rpcPort": ${CLIENT_RPC_PORT},
+  "socks5Port": ${CLIENT_SOCKS5_PORT},
+  "loggingLevel": "INFO",
+  "socks5ListenLAN": false,
+  "httpProxyPort": ${CLIENT_HTTP_PORT},
+  "httpProxyListenLAN": false
+}
+EOF
+}
+
+build_clash_yaml_entry() {
+  local ip="$1"
+  local proto="$2"
+  local p port_lines name_suffix
+  p="$(port_for_protocol "$proto")"
+  name_suffix="$(proto_lower "$proto")"
+  if [ -n "$PORT" ]; then
+    port_lines="    port: ${p}"
+  else
+    port_lines="    port-range: ${p}"
+  fi
+  cat <<EOF
   - name: mieru-mita-${name_suffix}
     type: mieru
     server: ${ip}
@@ -1078,7 +1227,14 @@ ${port_lines}
     password: ${PASSWORD}
     multiplexing: ${MULTIPLEXING}
 EOF
-  done < <(port_protocol_pairs)
+}
+
+build_clash_yaml() {
+  local ip="$1"
+  local proto
+  while IFS= read -r proto; do
+    build_clash_yaml_entry "$ip" "$proto"
+  done < <(protocols_for_mode)
 }
 
 build_clash_yaml_header() {
@@ -1093,7 +1249,12 @@ build_clash_yaml_full() {
 
 build_client_json() {
   local ip="$1"
-  local bindings="" pp proto p binding
+  local proto="${2:-}"
+  if [ -n "$proto" ]; then
+    build_client_json_for "$ip" "$proto"
+    return 0
+  fi
+  local bindings="" pp p binding
   while IFS= read -r pp; do
     proto="${pp%%|*}"
     p="${pp#*|}"
@@ -1157,28 +1318,53 @@ ${bindings}
 EOF
 }
 
+print_protocol_outputs() {
+  local ip="$1"
+  local proto link cfg_path ts suffix multi=0
+  ts="$(date +%Y%m%d_%H%M%S)"
+  if [ "$(protocols_for_mode | wc -l | tr -d ' ')" -gt 1 ]; then
+    multi=1
+  fi
+  while IFS= read -r proto; do
+    [ -n "$proto" ] || continue
+    suffix="$(proto_lower "$proto")"
+    msg ""
+    if [ "$multi" -eq 1 ]; then
+      t "【${proto} 节点链接】" "[${proto} share link]"
+    else
+      t '【节点链接】' '[Share link]'
+    fi
+    link="$(generate_share_link_for "$ip" "$proto")"
+    msg "$link"
+    if [ "$multi" -eq 1 ]; then
+      cfg_path="/root/mieru_client_${suffix}_${ts}.json"
+    else
+      cfg_path="/root/mieru_client_${ts}.json"
+    fi
+    msg ""
+    if [ "$multi" -eq 1 ]; then
+      t "【${proto} 客户端 JSON】（供 mieru 客户端使用，勿在服务器 mita apply）" \
+        "[${proto} client JSON] (for mieru client only — do NOT mita apply on server)"
+    else
+      t '【客户端 JSON 配置】（供 mieru 客户端使用，勿在服务器 mita apply）' \
+        '[Client JSON] (for mieru client only — do NOT mita apply on server)'
+    fi
+    if [ "$DRY_RUN" -ne 1 ]; then
+      build_client_json_for "$ip" "$proto" >"$cfg_path"
+      t "  已保存: ${cfg_path}" "  Saved:  ${cfg_path}"
+    fi
+    msg ""
+    build_client_json_for "$ip" "$proto"
+  done < <(protocols_for_mode)
+}
+
 print_summary() {
-  local ip link cfg_path
+  local ip
   ip="$(public_ip || true)"
   msg ""
   t '========== 安装完成 ==========' '========== Installation complete =========='
   if [ -n "$ip" ]; then
-    link="$(generate_share_link "$ip")"
-    msg ""
-    t '【节点链接】' '[Share link]'
-    msg "$link"
-    cfg_path="/root/mieru_client_$(date +%Y%m%d_%H%M%S).json"
-    if [ "$DRY_RUN" -ne 1 ]; then
-      build_client_json "$ip" >"$cfg_path"
-    fi
-    msg ""
-    t '【客户端 JSON 配置】（供 mieru 客户端使用，勿在服务器 mita apply）' \
-      '[Client JSON] (for mieru client only — do NOT mita apply on server)'
-    if [ "$DRY_RUN" -ne 1 ]; then
-      t "  已保存: ${cfg_path}" "  Saved:  ${cfg_path}"
-    fi
-    msg ""
-    build_client_json "$ip"
+    print_protocol_outputs "$ip"
   else
     warn "$(t '未能获取公网 IP，请手动将下方连接信息填入客户端' \
       'Could not detect public IP; use connection info below manually')"
@@ -1200,18 +1386,20 @@ print_summary() {
   fi
   msg ""
   t '导入方式:' 'Import options:'
-  msg '  mieru import config "<节点链接>"   # 简单链接不含 socks5Port，全新设备建议用 JSON'
-  msg '  mieru apply config /root/mieru_client_*.json'
+  if [ "$PROTOCOL" = "BOTH" ]; then
+    msg '  mieru import config "<TCP 节点链接>"   # 或分别导入 TCP / UDP 链接'
+    msg '  mieru apply config /root/mieru_client_tcp_*.json'
+    msg '  mieru apply config /root/mieru_client_udp_*.json'
+  else
+    msg '  mieru import config "<节点链接>"   # 简单链接不含 socks5Port，全新设备建议用 JSON'
+    msg '  mieru apply config /root/mieru_client_*.json'
+  fi
   if [ "$PROTOCOL" = "BOTH" ]; then
     msg ''
-    t '【客户端提示】双协议时：v2rayN/Clash 等请选传输 **tcp**（勿选「两个都」）；' \
-      '[Client tip] For dual protocol: use transport **tcp** in v2rayN/Clash (not "both").'
-    t '  Clash 用上方片段（transport: TCP + udp: true）即可覆盖 UDP 流量。' \
-      '  Clash snippet above (TCP + udp: true) handles UDP over TCP.'
-    if [ -n "$PORT" ]; then
-      t "  原生 UDP 传输需端口 ${PORT}→TCP、$((PORT + 1))→UDP。" \
-        "  Native UDP transport uses port ${PORT} for TCP and $((PORT + 1)) for UDP."
-    fi
+    t '【客户端提示】双协议已分开输出：TCP 与 UDP 各用对应链接/JSON；' \
+      '[Client tip] Dual protocol outputs are split: use matching TCP or UDP link/JSON.'
+    t '  v2rayN 导入后传输协议选 **tcp** 或 **udp**（勿选「两个都」）。' \
+      '  In v2rayN pick transport **tcp** or **udp** (not "both").'
   fi
   if [ -n "$ip" ]; then
     msg ""
@@ -1222,19 +1410,34 @@ print_summary() {
 }
 
 generate_client_config() {
-  local ip cfg_path
+  local ip ts suffix proto link cfg_path multi=0
   ip="$(public_ip || echo 'YOUR_SERVER_IP')"
-  cfg_path="/root/mieru_client_$(date +%Y%m%d_%H%M%S).json"
-  build_client_json "$ip" >"$cfg_path"
-  t "客户端配置已保存: ${cfg_path}" "Client config saved: ${cfg_path}"
-  local link
-  link="$(generate_share_link "$ip")"
-  msg ""
-  t '节点链接:' 'Share link:'
-  msg "$link"
-  msg ""
-  cat "$cfg_path"
-  msg ""
+  ts="$(date +%Y%m%d_%H%M%S)"
+  if [ "$(protocols_for_mode | wc -l | tr -d ' ')" -gt 1 ]; then
+    multi=1
+  fi
+  while IFS= read -r proto; do
+    [ -n "$proto" ] || continue
+    suffix="$(proto_lower "$proto")"
+    if [ "$multi" -eq 1 ]; then
+      cfg_path="/root/mieru_client_${suffix}_${ts}.json"
+    else
+      cfg_path="/root/mieru_client_${ts}.json"
+    fi
+    build_client_json_for "$ip" "$proto" >"$cfg_path"
+    t "客户端配置已保存: ${cfg_path}" "Client config saved: ${cfg_path}"
+    link="$(generate_share_link_for "$ip" "$proto")"
+    msg ""
+    if [ "$multi" -eq 1 ]; then
+      t "${proto} 节点链接:" "${proto} share link:"
+    else
+      t '节点链接:' 'Share link:'
+    fi
+    msg "$link"
+    msg ""
+    cat "$cfg_path"
+    msg ""
+  done < <(protocols_for_mode)
   t '【Clash / mihomo 配置片段】' '[Clash / mihomo snippet]'
   build_clash_yaml_full "$ip"
   cloud_firewall_hint
@@ -1385,26 +1588,46 @@ do_status() {
 do_client_config() {
   require_root
   mita_installed || die "$(t 'mita 未安装' 'mita is not installed')"
-  local desc bin
+  local desc bin bindings
   bin="$(mita_bin)"
   desc="$("$bin" describe config 2>/dev/null || true)"
   [ -n "$desc" ] || die "$(t '无法读取服务端配置' 'Cannot read server config')"
 
   USERNAME="$(printf '%s' "$desc" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
   PASSWORD="$(printf '%s' "$desc" | sed -n 's/.*"password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  PORT="$(printf '%s' "$desc" | sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
-  PORT_RANGE="$(printf '%s' "$desc" | sed -n 's/.*"portRange"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  local tcp_count udp_count
-  tcp_count="$(printf '%s' "$desc" | grep -c '"protocol"[[:space:]]*:[[:space:]]*"TCP"' || true)"
-  udp_count="$(printf '%s' "$desc" | grep -c '"protocol"[[:space:]]*:[[:space:]]*"UDP"' || true)"
-  if [ "$tcp_count" -gt 0 ] && [ "$udp_count" -gt 0 ]; then
-    PROTOCOL="TCP"
-  elif [ "$udp_count" -gt 0 ]; then
-    PROTOCOL="UDP"
-  else
-    PROTOCOL="TCP"
-  fi
   [ -n "$USERNAME" ] && [ -n "$PASSWORD" ] || die "$(t '配置中缺少用户信息' 'Missing user info in config')"
+
+  load_install_state
+  bindings="$(extract_bindings_from_describe "$desc")"
+  if [ -n "$bindings" ]; then
+    PORT=""
+    PORT_RANGE=""
+    local pp proto p has_tcp=0 has_udp=0 tcp_port=""
+    while IFS= read -r pp; do
+      [ -n "$pp" ] || continue
+      proto="${pp%%|*}"
+      p="${pp#*|}"
+      case "$proto" in
+        TCP)
+          has_tcp=1
+          if [[ "$p" =~ ^[0-9]+$ ]]; then
+            tcp_port="$p"
+          elif [[ "$p" == *-* ]]; then
+            PORT_RANGE="$p"
+          fi
+          ;;
+        UDP) has_udp=1 ;;
+      esac
+    done <<< "$bindings"
+    [ -n "$tcp_port" ] && PORT="$tcp_port"
+    if [ "$has_tcp" -gt 0 ] && [ "$has_udp" -gt 0 ]; then
+      PROTOCOL="BOTH"
+    elif [ "$has_udp" -gt 0 ]; then
+      PROTOCOL="UDP"
+    else
+      PROTOCOL="TCP"
+    fi
+  fi
   generate_client_config
 }
 
