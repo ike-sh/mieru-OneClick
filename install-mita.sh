@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.10"
+SCRIPT_VERSION="1.2.11"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -182,6 +182,27 @@ run() {
   else
     "$@"
   fi
+}
+
+# BusyBox mktemp（Alpine）要求 XXXXXX 在模板末尾；GNU 允许中间占位
+mktemp_file() {
+  local suffix="${1:-}"
+  local f
+  f="$(mktemp /tmp/mita.XXXXXX 2>/dev/null)" || f="/tmp/mita_$$_${RANDOM}"
+  [ -n "$suffix" ] || { printf '%s' "$f"; return; }
+  local out="${f}${suffix}"
+  if [ "$f" != "$out" ]; then
+    mv "$f" "$out" 2>/dev/null || { : >"$out"; rm -f "$f"; }
+  fi
+  printf '%s' "$out"
+}
+
+mktemp_dir() {
+  local d
+  d="$(mktemp -d /tmp/mita.XXXXXX 2>/dev/null)" \
+    || d="$(mktemp -d 2>/dev/null)" \
+    || { d="/tmp/mita_$$_${RANDOM}"; mkdir -p "$d"; }
+  printf '%s' "$d"
 }
 
 read_tty() {
@@ -506,7 +527,7 @@ verify_package_sha256() {
   [ "$DRY_RUN" -eq 1 ] && return 0
   STAGE="校验安装包 SHA256"
   local sha_file expected actual
-  sha_file="$(mktemp /tmp/mita_sha_XXXXXX.txt)"
+  sha_file="$(mktemp_file .txt)"
   if ! curl -fsSL --connect-timeout 15 --max-time 30 "$sha_url" -o "$sha_file" 2>/dev/null; then
     warn "$(t "无法下载校验文件，已跳过: ${sha_url}" "Checksum file unavailable, skipped: ${sha_url}")"
     rm -f "$sha_file"
@@ -619,7 +640,7 @@ extract_mita_tarball() {
   local tarball="$1"
   STAGE="解压 mita 二进制"
   local tmpdir bin
-  tmpdir="$(mktemp -d /tmp/mita_extract_XXXXXX)"
+  tmpdir="$(mktemp_dir)"
   run tar -xzf "$tarball" -C "$tmpdir"
   bin="$(find "$tmpdir" -type f -name mita | head -n1)"
   [ -n "$bin" ] || die "$(t '压缩包中未找到 mita 二进制' 'mita binary not found in archive')"
@@ -772,7 +793,7 @@ ensure_config_noninteractive() {
 
 write_server_config() {
   local cfg bindings="" proto pp
-  cfg="$(mktemp /tmp/mita_cfg_XXXXXX.json)"
+  cfg="$(mktemp_file .json)"
   while IFS= read -r pp; do
     proto="${pp%%|*}"
     local p="${pp#*|}"
@@ -1197,7 +1218,7 @@ enable_tcp_bbr() {
   fi
   local url="https://raw.githubusercontent.com/${UPSTREAM_REPO}/refs/heads/main/tools/enable_tcp_bbr.py"
   local tmp
-  tmp="$(mktemp /tmp/enable_bbr_XXXXXX.py)"
+  tmp="$(mktemp_file .py)"
   curl -fsSL -o "$tmp" "$url"
   chmod +x "$tmp"
   if command -v python3 >/dev/null 2>&1; then
@@ -1500,7 +1521,7 @@ do_install() {
 
   ver="$(query_latest_version)"
   url="$(package_url "$ver" "$pm" "$arch")"
-  tmp="$(mktemp "/tmp/mita_pkg_XXXXXX.${url##*.}")"
+  tmp="$(mktemp_file)"
   download_package "$url" "$tmp"
   install_package "$tmp" "$pm"
   rm -f "$tmp"
@@ -1540,7 +1561,7 @@ do_upgrade() {
     exit 0
   fi
   url="$(package_url "$ver" "$pm" "$arch")"
-  tmp="$(mktemp "/tmp/mita_pkg_XXXXXX.${url##*.}")"
+  tmp="$(mktemp_file)"
   download_package "$url" "$tmp"
   install_package "$tmp" "$pm"
   rm -f "$tmp"
