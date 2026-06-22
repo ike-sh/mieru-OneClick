@@ -3,7 +3,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.1"
+SCRIPT_VERSION="1.2.2"
 UPSTREAM_REPO="enfein/mieru"
 GITHUB_API="https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"
 GITHUB_DL="https://github.com/${UPSTREAM_REPO}/releases/download"
@@ -28,6 +28,11 @@ PROTOCOL="TCP"
 USERNAME=""
 PASSWORD=""
 OP_USER=""
+MTU=1400
+MULTIPLEXING="MULTIPLEXING_LOW"
+CLIENT_RPC_PORT=8964
+CLIENT_SOCKS5_PORT=1080
+CLIENT_HTTP_PORT=8080
 
 if [ -z "${BASH_VERSION:-}" ]; then
   echo "[错误] 请使用 bash 运行此脚本，例如: curl ... | sudo bash" >&2
@@ -651,7 +656,7 @@ write_server_config() {
     }
   ],
   "loggingLevel": "INFO",
-  "mtu": 1400
+  "mtu": ${MTU}
 }
 EOF
   else
@@ -670,7 +675,7 @@ EOF
     }
   ],
   "loggingLevel": "INFO",
-  "mtu": 1400
+  "mtu": ${MTU}
 }
 EOF
   fi
@@ -914,7 +919,7 @@ generate_share_link() {
   local enc_user enc_pass query
   enc_user="$(urlencode "$USERNAME")"
   enc_pass="$(urlencode "$PASSWORD")"
-  query="profile=default&mtu=1400&handshake-mode=HANDSHAKE_STANDARD"
+  query="profile=default&mtu=${MTU}&handshake-mode=HANDSHAKE_STANDARD&multiplexing=${MULTIPLEXING}"
   if [ -n "$PORT" ]; then
     query="${query}&port=${PORT}&protocol=${PROTOCOL}"
   else
@@ -941,6 +946,7 @@ ${port_lines}
     udp: true
     username: ${USERNAME}
     password: ${PASSWORD}
+    multiplexing: ${MULTIPLEXING}
 EOF
 }
 
@@ -964,6 +970,7 @@ build_client_json() {
       "servers": [
         {
           "ipAddress": "${ip}",
+          "domainName": "",
           "portBindings": [
             {
               ${port_json},
@@ -972,14 +979,20 @@ build_client_json() {
           ]
         }
       ],
+      "mtu": ${MTU},
+      "multiplexing": {
+        "level": "${MULTIPLEXING}"
+      },
       "handshakeMode": "HANDSHAKE_STANDARD"
     }
   ],
   "activeProfile": "default",
-  "rpcPort": 8964,
-  "socks5Port": 1080,
+  "rpcPort": ${CLIENT_RPC_PORT},
+  "socks5Port": ${CLIENT_SOCKS5_PORT},
   "loggingLevel": "INFO",
-  "httpProxyPort": 8080
+  "socks5ListenLAN": false,
+  "httpProxyPort": ${CLIENT_HTTP_PORT},
+  "httpProxyListenLAN": false
 }
 EOF
 }
@@ -999,7 +1012,8 @@ print_summary() {
       build_client_json "$ip" >"$cfg_path"
     fi
     msg ""
-    t '【客户端 JSON 配置】' '[Client JSON config]'
+    t '【客户端 JSON 配置】（供 mieru 客户端使用，勿在服务器 mita apply）' \
+      '[Client JSON] (for mieru client only — do NOT mita apply on server)'
     if [ "$DRY_RUN" -ne 1 ]; then
       t "  已保存: ${cfg_path}" "  Saved:  ${cfg_path}"
     fi
@@ -1022,7 +1036,7 @@ print_summary() {
   fi
   msg ""
   t '导入方式:' 'Import options:'
-  msg '  mieru import config "<节点链接>"'
+  msg '  mieru import config "<节点链接>"   # 简单链接不含 socks5Port，全新设备建议用 JSON'
   msg '  mieru apply config /root/mieru_client_*.json'
   if [ -n "$ip" ]; then
     msg ""
