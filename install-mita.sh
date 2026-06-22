@@ -3,7 +3,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.2"
+SCRIPT_VERSION="1.2.3"
 UPSTREAM_REPO="enfein/mieru"
 GITHUB_API="https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"
 GITHUB_DL="https://github.com/${UPSTREAM_REPO}/releases/download"
@@ -24,7 +24,7 @@ STAGE="初始化"
 
 PORT=""
 PORT_RANGE=""
-PROTOCOL="TCP"
+PROTOCOL="BOTH"
 USERNAME=""
 PASSWORD=""
 OP_USER=""
@@ -64,7 +64,7 @@ mieru mita 服务端一键安装 ${SCRIPT_VERSION}
   --yes, -y           跳过确认
   --port PORT         监听端口（1025-65535）
   --port-range RANGE  监听端口段，如 9000-9010
-  --protocol TCP|UDP  传输协议（默认 TCP）
+  --protocol TCP|UDP|BOTH  传输协议（默认 BOTH 同时监听 TCP+UDP）
   --user NAME         代理用户名
   --password PASS     代理密码
   --op-user USER      加入 mita 用户组的 Linux 用户
@@ -251,6 +251,48 @@ proto_lower() {
   printf '%s' "$1" | tr '[:upper:]' '[:lower:]'
 }
 
+normalize_protocol() {
+  local v
+  v="$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')"
+  case "$v" in
+    TCP|UDP|BOTH) printf '%s' "$v" ;;
+    DUAL|ALL|双协议) printf '%s' BOTH ;;
+    *) return 1 ;;
+  esac
+}
+
+protocols_for_mode() {
+  case "$PROTOCOL" in
+    BOTH) printf '%s\n' TCP UDP ;;
+    *) printf '%s\n' "$PROTOCOL" ;;
+  esac
+}
+
+protocol_label() {
+  case "$PROTOCOL" in
+    BOTH)
+      if [ "$LANG_ZH" -eq 1 ]; then
+        printf '%s' 'TCP + UDP（双协议）'
+      else
+        printf '%s' 'TCP + UDP (dual)'
+      fi
+      ;;
+    *) printf '%s' "$PROTOCOL" ;;
+  esac
+}
+
+port_protocol_pairs() {
+  local proto p
+  if [ -n "$PORT" ]; then
+    p="$PORT"
+  else
+    p="$PORT_RANGE"
+  fi
+  while IFS= read -r proto; do
+    printf '%s|%s\n' "$proto" "$p"
+  done < <(protocols_for_mode)
+}
+
 save_install_state() {
   STAGE="保存安装状态"
   run mkdir -p /etc/mita
@@ -276,7 +318,7 @@ installed_by_oneclick() {
 load_install_state() {
   PORT=""
   PORT_RANGE=""
-  PROTOCOL="TCP"
+  PROTOCOL="BOTH"
   [ -f "$MITA_STATE" ] || return 0
   # shellcheck disable=SC1090
   source "$MITA_STATE" 2>/dev/null || true
@@ -612,9 +654,9 @@ collect_config_interactive() {
   fi
 
   if [ "$PROTOCOL" != "TCP" ] && [ "$PROTOCOL" != "UDP" ]; then
-    read_tty PROTOCOL "$(t '协议 TCP/UDP [TCP]: ' 'Protocol TCP/UDP [TCP]: ')" || PROTOCOL="TCP"
-    PROTOCOL="${PROTOCOL:-TCP}"
-    PROTOCOL="$(printf '%s' "$PROTOCOL" | tr '[:lower:]' '[:upper:]')"
+    read_tty PROTOCOL "$(t '协议 TCP/UDP/双协议 [双协议]: ' 'Protocol TCP/UDP/BOTH [BOTH]: ')" || PROTOCOL="BOTH"
+    PROTOCOL="${PROTOCOL:-BOTH}"
+    PROTOCOL="$(normalize_protocol "$PROTOCOL" || echo BOTH)"
   fi
 }
 
@@ -633,21 +675,48 @@ ensure_config_noninteractive() {
   if [ -n "$PORT_RANGE" ]; then
     valid_port_range "$PORT_RANGE" || die "$(t '非法端口段' 'Invalid port range')"
   fi
-  PROTOCOL="$(printf '%s' "$PROTOCOL" | tr '[:lower:]' '[:upper:]')"
-  [ "$PROTOCOL" = "TCP" ] || [ "$PROTOCOL" = "UDP" ] || die "$(t '协议必须是 TCP 或 UDP' 'Protocol must be TCP or UDP')"
+  if normalize_protocol "$PROTOCOL" >/dev/null 2>&1; then
+    PROTOCOL="$(normalize_protocol "$PROTOCOL")"
+  else
+    PROTOCOL="BOTH"
+  fi
 }
 
 write_server_config() {
-  local cfg
+  local cfg bindings="" proto pp
   cfg="$(mktemp /tmp/mita_cfg_XXXXXX.json)"
-  if [ -n "$PORT" ]; then
-    cat >"$cfg" <<EOF
+  while IFS= read -r pp; do
+    proto="${pp%%|*}"
+    local p="${pp#*|}"
+    local binding
+    if [ -n "$PORT" ]; then
+      binding=$(cat <<EOB
+    {
+      "port": ${p},
+      "protocol": "${proto}"
+    }
+EOB
+)
+    else
+      binding=$(cat <<EOB
+    {
+      "portRange": "${p}",
+      "protocol": "${proto}"
+    }
+EOB
+)
+    fi
+    if [ -n "$bindings" ]; then
+      bindings="${bindings},
+${binding}"
+    else
+      bindings="${binding}"
+    fi
+  done < <(port_protocol_pairs)
+  cat >"$cfg" <<EOF
 {
   "portBindings": [
-    {
-      "port": ${PORT},
-      "protocol": "${PROTOCOL}"
-    }
+${bindings}
   ],
   "users": [
     {
@@ -659,26 +728,6 @@ write_server_config() {
   "mtu": ${MTU}
 }
 EOF
-  else
-    cat >"$cfg" <<EOF
-{
-  "portBindings": [
-    {
-      "portRange": "${PORT_RANGE}",
-      "protocol": "${PROTOCOL}"
-    }
-  ],
-  "users": [
-    {
-      "name": "${USERNAME}",
-      "password": "${PASSWORD}"
-    }
-  ],
-  "loggingLevel": "INFO",
-  "mtu": ${MTU}
-}
-EOF
-  fi
   printf '%s' "$cfg"
 }
 
@@ -699,8 +748,16 @@ collect_ports_from_mita() {
   fi
   PORT="$(printf '%s' "$desc" | sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
   PORT_RANGE="$(printf '%s' "$desc" | sed -n 's/.*"portRange"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  PROTOCOL="$(printf '%s' "$desc" | sed -n 's/.*"protocol"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  PROTOCOL="${PROTOCOL:-TCP}"
+  local tcp_count udp_count
+  tcp_count="$(printf '%s' "$desc" | grep -c '"protocol"[[:space:]]*:[[:space:]]*"TCP"' || true)"
+  udp_count="$(printf '%s' "$desc" | grep -c '"protocol"[[:space:]]*:[[:space:]]*"UDP"' || true)"
+  if [ "$tcp_count" -gt 0 ] && [ "$udp_count" -gt 0 ]; then
+    PROTOCOL="BOTH"
+  elif [ "$udp_count" -gt 0 ]; then
+    PROTOCOL="UDP"
+  else
+    PROTOCOL="TCP"
+  fi
 }
 
 ufw_rule_spec() {
@@ -752,8 +809,7 @@ persist_iptables_rules() {
 
 open_firewall() {
   STAGE="配置防火墙"
-  local ports=() proto
-  proto="$(proto_lower "$PROTOCOL")"
+  local ports=() proto_item proto fw=""
   if [ -n "$PORT" ]; then
     ports+=("$PORT")
   elif [ -n "$PORT_RANGE" ]; then
@@ -762,30 +818,48 @@ open_firewall() {
   [ "${#ports[@]}" -gt 0 ] || return 0
 
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
-    for p in "${ports[@]}"; do
-      run ufw allow "$(ufw_rule_spec "$p" "$proto")" || true
-    done
+    fw=ufw
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    for p in "${ports[@]}"; do
-      run firewall-cmd --permanent --add-port="${p}/${proto}" || true
-    done
-    run firewall-cmd --reload || true
+    fw=firewalld
   elif command -v iptables >/dev/null 2>&1; then
-    for p in "${ports[@]}"; do
-      iptables_accept_port "$p" "$proto" add
-    done
-    persist_iptables_rules
+    fw=iptables
   else
     warn "$(t '未检测到本地防火墙工具，请仅在云安全组放行端口' \
       'No local firewall tool found; open ports in cloud security group')"
+    return 0
   fi
+
+  while IFS= read -r proto_item; do
+    proto="$(proto_lower "$proto_item")"
+    case "$fw" in
+      ufw)
+        for p in "${ports[@]}"; do
+          run ufw allow "$(ufw_rule_spec "$p" "$proto")" || true
+        done
+        ;;
+      firewalld)
+        for p in "${ports[@]}"; do
+          run firewall-cmd --permanent --add-port="${p}/${proto}" || true
+        done
+        ;;
+      iptables)
+        for p in "${ports[@]}"; do
+          iptables_accept_port "$p" "$proto" add
+        done
+        ;;
+    esac
+  done < <(protocols_for_mode)
+
+  case "$fw" in
+    firewalld) run firewall-cmd --reload || true ;;
+    iptables) persist_iptables_rules ;;
+  esac
 }
 
 close_firewall() {
   STAGE="清理防火墙规则"
   collect_ports_from_mita
-  local ports=() proto
-  proto="$(proto_lower "$PROTOCOL")"
+  local ports=() proto_item proto fw=""
   if [ -n "$PORT" ]; then
     ports+=("$PORT")
   elif [ -n "$PORT_RANGE" ]; then
@@ -794,30 +868,55 @@ close_firewall() {
   [ "${#ports[@]}" -gt 0 ] || return 0
 
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
-    for p in "${ports[@]}"; do
-      run ufw delete allow "$(ufw_rule_spec "$p" "$proto")" 2>/dev/null || true
-    done
+    fw=ufw
   elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
-    for p in "${ports[@]}"; do
-      run firewall-cmd --permanent --remove-port="${p}/${proto}" 2>/dev/null || true
-    done
-    run firewall-cmd --reload 2>/dev/null || true
+    fw=firewalld
   elif command -v iptables >/dev/null 2>&1; then
-    for p in "${ports[@]}"; do
-      iptables_accept_port "$p" "$proto" del
-    done
-    persist_iptables_rules
+    fw=iptables
+  else
+    return 0
   fi
+
+  while IFS= read -r proto_item; do
+    proto="$(proto_lower "$proto_item")"
+    case "$fw" in
+      ufw)
+        for p in "${ports[@]}"; do
+          run ufw delete allow "$(ufw_rule_spec "$p" "$proto")" 2>/dev/null || true
+        done
+        ;;
+      firewalld)
+        for p in "${ports[@]}"; do
+          run firewall-cmd --permanent --remove-port="${p}/${proto}" 2>/dev/null || true
+        done
+        ;;
+      iptables)
+        for p in "${ports[@]}"; do
+          iptables_accept_port "$p" "$proto" del
+        done
+        ;;
+    esac
+  done < <(protocols_for_mode)
+
+  case "$fw" in
+    firewalld) run firewall-cmd --reload 2>/dev/null || true ;;
+    iptables) persist_iptables_rules ;;
+  esac
 }
 
 cloud_firewall_hint() {
-  local spec=""
+  local specs=() proto_item spec
   if [ -n "$PORT" ]; then
-    spec="${PORT}/${PROTOCOL}"
+  while IFS= read -r proto_item; do
+    specs+=("${PORT}/${proto_item}")
+  done < <(protocols_for_mode)
   elif [ -n "$PORT_RANGE" ]; then
-    spec="${PORT_RANGE}/${PROTOCOL}"
+  while IFS= read -r proto_item; do
+    specs+=("${PORT_RANGE}/${proto_item}")
+  done < <(protocols_for_mode)
   fi
-  [ -n "$spec" ] || return 0
+  [ "${#specs[@]}" -gt 0 ] || return 0
+  spec="$(IFS=','; printf '%s' "${specs[*]}")"
   msg ""
   t "【云安全组提醒】请在 VPS/云控制台安全组放行: ${spec}" \
     "[Cloud SG] Allow in provider firewall: ${spec}"
@@ -916,48 +1015,92 @@ urlencode() {
 
 generate_share_link() {
   local ip="$1"
-  local enc_user enc_pass query
+  local enc_user enc_pass query pp proto p host
   enc_user="$(urlencode "$USERNAME")"
   enc_pass="$(urlencode "$PASSWORD")"
-  query="profile=default&mtu=${MTU}&handshake-mode=HANDSHAKE_STANDARD&multiplexing=${MULTIPLEXING}"
+  query="handshake-mode=HANDSHAKE_STANDARD&mtu=${MTU}&multiplexing=${MULTIPLEXING}"
+  while IFS= read -r pp; do
+    p="${pp#*|}"
+    query="${query}&port=${p}"
+  done < <(port_protocol_pairs)
+  query="${query}&profile=default"
+  while IFS= read -r pp; do
+    proto="${pp%%|*}"
+    query="${query}&protocol=${proto}"
+  done < <(port_protocol_pairs)
+  host="$ip"
   if [ -n "$PORT" ]; then
-    query="${query}&port=${PORT}&protocol=${PROTOCOL}"
-  else
-    query="${query}&port=${PORT_RANGE}&protocol=${PROTOCOL}"
+    host="${ip}:${PORT}"
   fi
-  printf 'mierus://%s:%s@%s?%s' "$enc_user" "$enc_pass" "$ip" "$query"
+  printf 'mierus://%s:%s@%s?%s' "$enc_user" "$enc_pass" "$host" "$query"
 }
 
 build_clash_yaml() {
   local ip="$1"
-  local port_lines
-  if [ -n "$PORT" ]; then
-    port_lines="    port: ${PORT}"
-  else
-    port_lines="    port-range: ${PORT_RANGE}"
-  fi
-  cat <<EOF
-proxies:
-  - name: mieru-mita
+  local pp proto p port_lines name_suffix
+  while IFS= read -r pp; do
+    proto="${pp%%|*}"
+    p="${pp#*|}"
+    name_suffix="$(proto_lower "$proto")"
+    if [ -n "$PORT" ]; then
+      port_lines="    port: ${p}"
+    else
+      port_lines="    port-range: ${p}"
+    fi
+    cat <<EOF
+  - name: mieru-mita-${name_suffix}
     type: mieru
     server: ${ip}
 ${port_lines}
-    transport: ${PROTOCOL}
+    transport: ${proto}
     udp: true
     username: ${USERNAME}
     password: ${PASSWORD}
     multiplexing: ${MULTIPLEXING}
 EOF
+  done < <(port_protocol_pairs)
+}
+
+build_clash_yaml_header() {
+  printf '%s\n' 'proxies:'
+}
+
+build_clash_yaml_full() {
+  local ip="$1"
+  build_clash_yaml_header
+  build_clash_yaml "$ip"
 }
 
 build_client_json() {
   local ip="$1"
-  local port_json
-  if [ -n "$PORT" ]; then
-    port_json="\"port\": ${PORT}"
-  else
-    port_json="\"portRange\": \"${PORT_RANGE}\""
-  fi
+  local bindings="" pp proto p binding
+  while IFS= read -r pp; do
+    proto="${pp%%|*}"
+    p="${pp#*|}"
+    if [ -n "$PORT" ]; then
+      binding=$(cat <<EOB
+            {
+              "port": ${p},
+              "protocol": "${proto}"
+            }
+EOB
+)
+    else
+      binding=$(cat <<EOB
+            {
+              "portRange": "${p}",
+              "protocol": "${proto}"
+            }
+EOB
+)
+    fi
+    if [ -n "$bindings" ]; then
+      bindings="${bindings},
+${binding}"
+    else
+      bindings="${binding}"
+    fi
+  done < <(port_protocol_pairs)
   cat <<EOF
 {
   "profiles": [
@@ -972,10 +1115,7 @@ build_client_json() {
           "ipAddress": "${ip}",
           "domainName": "",
           "portBindings": [
-            {
-              ${port_json},
-              "protocol": "${PROTOCOL}"
-            }
+${bindings}
           ]
         }
       ],
@@ -1028,7 +1168,7 @@ print_summary() {
   t "  服务器: ${ip:-<未知>}" "  Server:   ${ip:-<unknown>}"
   t "  用户名: ${USERNAME}" "  Username: ${USERNAME}"
   t "  密码:   ${PASSWORD}" "  Password: ${PASSWORD}"
-  t "  协议:   ${PROTOCOL}" "  Protocol: ${PROTOCOL}"
+  t "  协议:   $(protocol_label)" "  Protocol: $(protocol_label)"
   if [ -n "$PORT" ]; then
     t "  端口:   ${PORT}" "  Port:     ${PORT}"
   else
@@ -1041,7 +1181,7 @@ print_summary() {
   if [ -n "$ip" ]; then
     msg ""
     t '【Clash / mihomo 配置片段】' '[Clash / mihomo snippet]'
-    build_clash_yaml "$ip"
+    build_clash_yaml_full "$ip"
   fi
   cloud_firewall_hint
 }
@@ -1061,7 +1201,7 @@ generate_client_config() {
   cat "$cfg_path"
   msg ""
   t '【Clash / mihomo 配置片段】' '[Clash / mihomo snippet]'
-  build_clash_yaml "$ip"
+  build_clash_yaml_full "$ip"
   cloud_firewall_hint
 }
 
@@ -1217,9 +1357,18 @@ do_client_config() {
 
   USERNAME="$(printf '%s' "$desc" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
   PASSWORD="$(printf '%s' "$desc" | sed -n 's/.*"password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  PROTOCOL="$(printf '%s' "$desc" | sed -n 's/.*"protocol"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
   PORT="$(printf '%s' "$desc" | sed -n 's/.*"port"[[:space:]]*:[[:space:]]*\([0-9][0-9]*\).*/\1/p' | head -n1)"
   PORT_RANGE="$(printf '%s' "$desc" | sed -n 's/.*"portRange"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  local tcp_count udp_count
+  tcp_count="$(printf '%s' "$desc" | grep -c '"protocol"[[:space:]]*:[[:space:]]*"TCP"' || true)"
+  udp_count="$(printf '%s' "$desc" | grep -c '"protocol"[[:space:]]*:[[:space:]]*"UDP"' || true)"
+  if [ "$tcp_count" -gt 0 ] && [ "$udp_count" -gt 0 ]; then
+    PROTOCOL="BOTH"
+  elif [ "$udp_count" -gt 0 ]; then
+    PROTOCOL="UDP"
+  else
+    PROTOCOL="TCP"
+  fi
   [ -n "$USERNAME" ] && [ -n "$PASSWORD" ] || die "$(t '配置中缺少用户信息' 'Missing user info in config')"
   generate_client_config
 }
