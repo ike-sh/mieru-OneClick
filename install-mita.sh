@@ -3,7 +3,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.3"
+SCRIPT_VERSION="1.2.4"
 UPSTREAM_REPO="enfein/mieru"
 GITHUB_API="https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"
 GITHUB_DL="https://github.com/${UPSTREAM_REPO}/releases/download"
@@ -24,7 +24,7 @@ STAGE="初始化"
 
 PORT=""
 PORT_RANGE=""
-PROTOCOL="BOTH"
+PROTOCOL="TCP"
 USERNAME=""
 PASSWORD=""
 OP_USER=""
@@ -64,7 +64,7 @@ mieru mita 服务端一键安装 ${SCRIPT_VERSION}
   --yes, -y           跳过确认
   --port PORT         监听端口（1025-65535）
   --port-range RANGE  监听端口段，如 9000-9010
-  --protocol TCP|UDP|BOTH  传输协议（默认 BOTH 同时监听 TCP+UDP）
+  --protocol TCP|UDP|BOTH  传输协议（默认 TCP；BOTH 时 UDP 使用 PORT+1）
   --user NAME         代理用户名
   --password PASS     代理密码
   --op-user USER      加入 mita 用户组的 Linux 用户
@@ -271,24 +271,45 @@ protocols_for_mode() {
 protocol_label() {
   case "$PROTOCOL" in
     BOTH)
-      if [ "$LANG_ZH" -eq 1 ]; then
-        printf '%s' 'TCP + UDP（双协议）'
+      if [ -n "$PORT" ]; then
+        if [ "$LANG_ZH" -eq 1 ]; then
+          printf '%s' "TCP(${PORT}) + UDP($((PORT + 1)))"
+        else
+          printf '%s' "TCP(${PORT}) + UDP($((PORT + 1)))"
+        fi
       else
-        printf '%s' 'TCP + UDP (dual)'
+        if [ "$LANG_ZH" -eq 1 ]; then
+          printf '%s' 'TCP + UDP（同端口段）'
+        else
+          printf '%s' 'TCP + UDP (same port range)'
+        fi
       fi
       ;;
     *) printf '%s' "$PROTOCOL" ;;
   esac
 }
 
+port_for_protocol() {
+  local proto="$1"
+  if [ -n "$PORT" ]; then
+    if [ "$PROTOCOL" = "BOTH" ] && [ "$proto" = "UDP" ]; then
+      printf '%s' "$((PORT + 1))"
+    else
+      printf '%s' "$PORT"
+    fi
+  else
+    printf '%s' "$PORT_RANGE"
+  fi
+}
+
 port_protocol_pairs() {
   local proto p
-  if [ -n "$PORT" ]; then
-    p="$PORT"
-  else
-    p="$PORT_RANGE"
-  fi
   while IFS= read -r proto; do
+    p="$(port_for_protocol "$proto")"
+    if [ -n "$PORT" ]; then
+      valid_port "$p" || die "$(t "双协议需要 ${PORT} 与 $((PORT + 1)) 均在 1025-65535" \
+        "Dual protocol requires ports ${PORT} and $((PORT + 1)) in 1025-65535")"
+    fi
     printf '%s|%s\n' "$proto" "$p"
   done < <(protocols_for_mode)
 }
@@ -318,7 +339,7 @@ installed_by_oneclick() {
 load_install_state() {
   PORT=""
   PORT_RANGE=""
-  PROTOCOL="BOTH"
+  PROTOCOL="TCP"
   [ -f "$MITA_STATE" ] || return 0
   # shellcheck disable=SC1090
   source "$MITA_STATE" 2>/dev/null || true
@@ -654,9 +675,13 @@ collect_config_interactive() {
   fi
 
   if [ "$PROTOCOL" != "TCP" ] && [ "$PROTOCOL" != "UDP" ]; then
-    read_tty PROTOCOL "$(t '协议 TCP/UDP/双协议 [双协议]: ' 'Protocol TCP/UDP/BOTH [BOTH]: ')" || PROTOCOL="BOTH"
-    PROTOCOL="${PROTOCOL:-BOTH}"
-    PROTOCOL="$(normalize_protocol "$PROTOCOL" || echo BOTH)"
+    read_tty PROTOCOL "$(t '协议 TCP/UDP/双协议 [TCP]: ' 'Protocol TCP/UDP/BOTH [TCP]: ')" || PROTOCOL="TCP"
+    PROTOCOL="${PROTOCOL:-TCP}"
+    PROTOCOL="$(normalize_protocol "$PROTOCOL" || echo TCP)"
+  fi
+  if [ "$PROTOCOL" = "BOTH" ] && [ -n "$PORT" ] && [ "$PORT" -ge 65535 ]; then
+    die "$(t '双协议需要主端口 ≤65534（UDP 使用主端口+1）' \
+      'Dual protocol needs main port ≤65534 (UDP uses main port + 1)')"
   fi
 }
 
@@ -678,7 +703,10 @@ ensure_config_noninteractive() {
   if normalize_protocol "$PROTOCOL" >/dev/null 2>&1; then
     PROTOCOL="$(normalize_protocol "$PROTOCOL")"
   else
-    PROTOCOL="BOTH"
+    PROTOCOL="TCP"
+  fi
+  if [ "$PROTOCOL" = "BOTH" ] && [ -n "$PORT" ] && [ "$PORT" -ge 65535 ]; then
+    die "$(t '双协议需要主端口 ≤65534' 'Dual protocol needs main port ≤65534')"
   fi
 }
 
@@ -752,7 +780,7 @@ collect_ports_from_mita() {
   tcp_count="$(printf '%s' "$desc" | grep -c '"protocol"[[:space:]]*:[[:space:]]*"TCP"' || true)"
   udp_count="$(printf '%s' "$desc" | grep -c '"protocol"[[:space:]]*:[[:space:]]*"UDP"' || true)"
   if [ "$tcp_count" -gt 0 ] && [ "$udp_count" -gt 0 ]; then
-    PROTOCOL="BOTH"
+    PROTOCOL="TCP"
   elif [ "$udp_count" -gt 0 ]; then
     PROTOCOL="UDP"
   else
@@ -809,13 +837,10 @@ persist_iptables_rules() {
 
 open_firewall() {
   STAGE="配置防火墙"
-  local ports=() proto_item proto fw=""
-  if [ -n "$PORT" ]; then
-    ports+=("$PORT")
-  elif [ -n "$PORT_RANGE" ]; then
-    ports+=("$PORT_RANGE")
+  local pp proto p proto_lc fw=""
+  if ! pp="$(port_protocol_pairs | head -n1)" || [ -z "$pp" ]; then
+    return 0
   fi
-  [ "${#ports[@]}" -gt 0 ] || return 0
 
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
     fw=ufw
@@ -829,26 +854,16 @@ open_firewall() {
     return 0
   fi
 
-  while IFS= read -r proto_item; do
-    proto="$(proto_lower "$proto_item")"
+  while IFS= read -r pp; do
+    proto="${pp%%|*}"
+    p="${pp#*|}"
+    proto_lc="$(proto_lower "$proto")"
     case "$fw" in
-      ufw)
-        for p in "${ports[@]}"; do
-          run ufw allow "$(ufw_rule_spec "$p" "$proto")" || true
-        done
-        ;;
-      firewalld)
-        for p in "${ports[@]}"; do
-          run firewall-cmd --permanent --add-port="${p}/${proto}" || true
-        done
-        ;;
-      iptables)
-        for p in "${ports[@]}"; do
-          iptables_accept_port "$p" "$proto" add
-        done
-        ;;
+      ufw) run ufw allow "$(ufw_rule_spec "$p" "$proto_lc")" || true ;;
+      firewalld) run firewall-cmd --permanent --add-port="${p}/${proto_lc}" || true ;;
+      iptables) iptables_accept_port "$p" "$proto_lc" add ;;
     esac
-  done < <(protocols_for_mode)
+  done < <(port_protocol_pairs)
 
   case "$fw" in
     firewalld) run firewall-cmd --reload || true ;;
@@ -859,13 +874,10 @@ open_firewall() {
 close_firewall() {
   STAGE="清理防火墙规则"
   collect_ports_from_mita
-  local ports=() proto_item proto fw=""
-  if [ -n "$PORT" ]; then
-    ports+=("$PORT")
-  elif [ -n "$PORT_RANGE" ]; then
-    ports+=("$PORT_RANGE")
+  local pp proto p proto_lc fw=""
+  if ! pp="$(port_protocol_pairs | head -n1)" || [ -z "$pp" ]; then
+    return 0
   fi
-  [ "${#ports[@]}" -gt 0 ] || return 0
 
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
     fw=ufw
@@ -877,26 +889,16 @@ close_firewall() {
     return 0
   fi
 
-  while IFS= read -r proto_item; do
-    proto="$(proto_lower "$proto_item")"
+  while IFS= read -r pp; do
+    proto="${pp%%|*}"
+    p="${pp#*|}"
+    proto_lc="$(proto_lower "$proto")"
     case "$fw" in
-      ufw)
-        for p in "${ports[@]}"; do
-          run ufw delete allow "$(ufw_rule_spec "$p" "$proto")" 2>/dev/null || true
-        done
-        ;;
-      firewalld)
-        for p in "${ports[@]}"; do
-          run firewall-cmd --permanent --remove-port="${p}/${proto}" 2>/dev/null || true
-        done
-        ;;
-      iptables)
-        for p in "${ports[@]}"; do
-          iptables_accept_port "$p" "$proto" del
-        done
-        ;;
+      ufw) run ufw delete allow "$(ufw_rule_spec "$p" "$proto_lc")" 2>/dev/null || true ;;
+      firewalld) run firewall-cmd --permanent --remove-port="${p}/${proto_lc}" 2>/dev/null || true ;;
+      iptables) iptables_accept_port "$p" "$proto_lc" del ;;
     esac
-  done < <(protocols_for_mode)
+  done < <(port_protocol_pairs)
 
   case "$fw" in
     firewalld) run firewall-cmd --reload 2>/dev/null || true ;;
@@ -905,17 +907,14 @@ close_firewall() {
 }
 
 cloud_firewall_hint() {
-  local specs=() proto_item spec
-  if [ -n "$PORT" ]; then
-  while IFS= read -r proto_item; do
-    specs+=("${PORT}/${proto_item}")
-  done < <(protocols_for_mode)
-  elif [ -n "$PORT_RANGE" ]; then
-  while IFS= read -r proto_item; do
-    specs+=("${PORT_RANGE}/${proto_item}")
-  done < <(protocols_for_mode)
-  fi
+  local specs=() pp proto p
+  while IFS= read -r pp; do
+    proto="${pp%%|*}"
+    p="${pp#*|}"
+    specs+=("${p}/${proto}")
+  done < <(port_protocol_pairs)
   [ "${#specs[@]}" -gt 0 ] || return 0
+  local spec
   spec="$(IFS=','; printf '%s' "${specs[*]}")"
   msg ""
   t "【云安全组提醒】请在 VPS/云控制台安全组放行: ${spec}" \
@@ -938,30 +937,31 @@ start_mita() {
   case "$sm" in
     systemd)
       run systemctl enable mita 2>/dev/null || true
-      run systemctl restart mita 2>/dev/null || run "$bin" start
+      run systemctl restart mita 2>/dev/null || true
       ;;
     openrc)
       run rc-update add mita default 2>/dev/null || true
-      run rc-service mita restart 2>/dev/null || run "$bin" start
-      ;;
-    *)
-      run "$bin" start
+      run rc-service mita restart 2>/dev/null || true
       ;;
   esac
+  run "$bin" start
 }
 
 verify_mita_running() {
   STAGE="验证服务状态"
-  local bin status_out
+  local bin status_out attempt
   bin="$(mita_bin)"
-  sleep 2
-  status_out="$("$bin" status 2>/dev/null || true)"
-  if printf '%s' "$status_out" | grep -q 'RUNNING'; then
-    t 'mita 服务运行正常' 'mita service is running'
-    return 0
-  fi
-  warn "$(t 'mita 可能未处于 RUNNING 状态，请执行: mita status' \
-    'mita may not be RUNNING; check: mita status')"
+  for attempt in 1 2 3; do
+    sleep 2
+    status_out="$("$bin" status 2>/dev/null || true)"
+    if printf '%s' "$status_out" | grep -q 'status is "RUNNING"'; then
+      t 'mita 服务运行正常' 'mita service is running'
+      return 0
+    fi
+    run "$bin" start 2>/dev/null || true
+  done
+  warn "$(t 'mita 未处于 RUNNING 状态，请执行: mita status && mita start' \
+    'mita is not RUNNING; run: mita status && mita start')"
   msg "$status_out"
 }
 
@@ -1038,6 +1038,26 @@ generate_share_link() {
 build_clash_yaml() {
   local ip="$1"
   local pp proto p port_lines name_suffix
+  if [ "$PROTOCOL" = "BOTH" ]; then
+    p="$(port_for_protocol TCP)"
+    if [ -n "$PORT" ]; then
+      port_lines="    port: ${p}"
+    else
+      port_lines="    port-range: ${p}"
+    fi
+    cat <<EOF
+  - name: mieru-mita
+    type: mieru
+    server: ${ip}
+${port_lines}
+    transport: TCP
+    udp: true
+    username: ${USERNAME}
+    password: ${PASSWORD}
+    multiplexing: ${MULTIPLEXING}
+EOF
+    return 0
+  fi
   while IFS= read -r pp; do
     proto="${pp%%|*}"
     p="${pp#*|}"
@@ -1170,7 +1190,11 @@ print_summary() {
   t "  密码:   ${PASSWORD}" "  Password: ${PASSWORD}"
   t "  协议:   $(protocol_label)" "  Protocol: $(protocol_label)"
   if [ -n "$PORT" ]; then
-    t "  端口:   ${PORT}" "  Port:     ${PORT}"
+    if [ "$PROTOCOL" = "BOTH" ]; then
+      t "  端口:   TCP ${PORT} / UDP $((PORT + 1))" "  Ports:    TCP ${PORT} / UDP $((PORT + 1))"
+    else
+      t "  端口:   ${PORT}" "  Port:     ${PORT}"
+    fi
   else
     t "  端口段: ${PORT_RANGE}" "  Port range: ${PORT_RANGE}"
   fi
@@ -1178,6 +1202,17 @@ print_summary() {
   t '导入方式:' 'Import options:'
   msg '  mieru import config "<节点链接>"   # 简单链接不含 socks5Port，全新设备建议用 JSON'
   msg '  mieru apply config /root/mieru_client_*.json'
+  if [ "$PROTOCOL" = "BOTH" ]; then
+    msg ''
+    t '【客户端提示】双协议时：v2rayN/Clash 等请选传输 **tcp**（勿选「两个都」）；' \
+      '[Client tip] For dual protocol: use transport **tcp** in v2rayN/Clash (not "both").'
+    t '  Clash 用上方片段（transport: TCP + udp: true）即可覆盖 UDP 流量。' \
+      '  Clash snippet above (TCP + udp: true) handles UDP over TCP.'
+    if [ -n "$PORT" ]; then
+      t "  原生 UDP 传输需端口 ${PORT}→TCP、$((PORT + 1))→UDP。" \
+        "  Native UDP transport uses port ${PORT} for TCP and $((PORT + 1)) for UDP."
+    fi
+  fi
   if [ -n "$ip" ]; then
     msg ""
     t '【Clash / mihomo 配置片段】' '[Clash / mihomo snippet]'
@@ -1363,7 +1398,7 @@ do_client_config() {
   tcp_count="$(printf '%s' "$desc" | grep -c '"protocol"[[:space:]]*:[[:space:]]*"TCP"' || true)"
   udp_count="$(printf '%s' "$desc" | grep -c '"protocol"[[:space:]]*:[[:space:]]*"UDP"' || true)"
   if [ "$tcp_count" -gt 0 ] && [ "$udp_count" -gt 0 ]; then
-    PROTOCOL="BOTH"
+    PROTOCOL="TCP"
   elif [ "$udp_count" -gt 0 ]; then
     PROTOCOL="UDP"
   else
