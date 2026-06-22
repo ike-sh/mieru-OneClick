@@ -21,6 +21,12 @@ curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-
 5. 安装完成**同时输出** `mierus://` 节点链接、客户端 JSON、**Clash/mihomo 片段**及连接信息摘要
 6. 下载包 **SHA256 校验**；提示云安全组放行端口
 
+### v1.2.8 增强
+
+- 交互菜单顶部显示 **版本号 v1.2.8** 与 **作者 ike**
+- 移除未使用的 `build_client_json` 聚合函数（孤立代码）
+- 卸载时显式清理 `mieru_client_tcp_*.json` / `mieru_client_udp_*.json`
+
 ### v1.2.7 修复
 
 - 交互安装增加 **编号菜单** 选择传输协议（1=TCP / 2=UDP / 3=双协议），置于端口询问之前

@@ -1,9 +1,12 @@
 #!/usr/bin/env bash
 # mieru / mita 服务端一键安装脚本
+# 作者: ike · https://github.com/ike-sh/mieru-OneClick
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.7"
+SCRIPT_VERSION="1.2.8"
+SCRIPT_AUTHOR="ike"
+SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
 GITHUB_API="https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"
 GITHUB_DL="https://github.com/${UPSTREAM_REPO}/releases/download"
@@ -100,6 +103,14 @@ t() {
   fi
 }
 
+print_banner() {
+  msg ""
+  t "mieru mita 服务端一键安装  v${SCRIPT_VERSION}" \
+    "mieru mita server one-click installer  v${SCRIPT_VERSION}"
+  t "作者: ${SCRIPT_AUTHOR} · https://github.com/${SCRIPT_REPO}" \
+    "Author: ${SCRIPT_AUTHOR} · https://github.com/${SCRIPT_REPO}"
+}
+
 while [ $# -gt 0 ]; do
   case "$1" in
     --install) ACTION=install ;;
@@ -145,7 +156,7 @@ while [ $# -gt 0 ]; do
       shift
       ;;
     --help|-h) usage; exit 0 ;;
-    --version) echo "mieru-OneClick install-mita.sh ${SCRIPT_VERSION}"; exit 0 ;;
+    --version) echo "mieru-OneClick install-mita.sh ${SCRIPT_VERSION} by ${SCRIPT_AUTHOR}"; exit 0 ;;
     *) die "未知参数：$1（使用 --help 查看帮助）" ;;
   esac
   shift
@@ -1247,82 +1258,21 @@ build_clash_yaml_full() {
   build_clash_yaml "$ip"
 }
 
-build_client_json() {
-  local ip="$1"
-  local proto="${2:-}"
-  if [ -n "$proto" ]; then
-    build_client_json_for "$ip" "$proto"
-    return 0
-  fi
-  local bindings="" pp p binding
-  while IFS= read -r pp; do
-    proto="${pp%%|*}"
-    p="${pp#*|}"
-    if [ -n "$PORT" ]; then
-      binding=$(cat <<EOB
-            {
-              "port": ${p},
-              "protocol": "${proto}"
-            }
-EOB
-)
-    else
-      binding=$(cat <<EOB
-            {
-              "portRange": "${p}",
-              "protocol": "${proto}"
-            }
-EOB
-)
-    fi
-    if [ -n "$bindings" ]; then
-      bindings="${bindings},
-${binding}"
-    else
-      bindings="${binding}"
-    fi
-  done < <(port_protocol_pairs)
-  cat <<EOF
-{
-  "profiles": [
-    {
-      "profileName": "default",
-      "user": {
-        "name": "${USERNAME}",
-        "password": "${PASSWORD}"
-      },
-      "servers": [
-        {
-          "ipAddress": "${ip}",
-          "domainName": "",
-          "portBindings": [
-${bindings}
-          ]
-        }
-      ],
-      "mtu": ${MTU},
-      "multiplexing": {
-        "level": "${MULTIPLEXING}"
-      },
-      "handshakeMode": "HANDSHAKE_STANDARD"
-    }
-  ],
-  "activeProfile": "default",
-  "rpcPort": ${CLIENT_RPC_PORT},
-  "socks5Port": ${CLIENT_SOCKS5_PORT},
-  "loggingLevel": "INFO",
-  "socks5ListenLAN": false,
-  "httpProxyPort": ${CLIENT_HTTP_PORT},
-  "httpProxyListenLAN": false
-}
-EOF
+protocol_output_count() {
+  local n=0 proto
+  while IFS= read -r proto; do
+    [ -n "$proto" ] || continue
+    n=$((n + 1))
+  done < <(protocols_for_mode)
+  printf '%s' "$n"
 }
 
 print_protocol_outputs() {
   local ip="$1"
-  local proto link cfg_path ts suffix multi=0
+  local proto link cfg_path ts suffix multi=0 count
   ts="$(date +%Y%m%d_%H%M%S)"
-  if [ "$(protocols_for_mode | wc -l | tr -d ' ')" -gt 1 ]; then
+  count="$(protocol_output_count)"
+  if [ "$count" -gt 1 ]; then
     multi=1
   fi
   while IFS= read -r proto; do
@@ -1410,10 +1360,11 @@ print_summary() {
 }
 
 generate_client_config() {
-  local ip ts suffix proto link cfg_path multi=0
+  local ip ts suffix proto link cfg_path multi=0 count
   ip="$(public_ip || echo 'YOUR_SERVER_IP')"
   ts="$(date +%Y%m%d_%H%M%S)"
-  if [ "$(protocols_for_mode | wc -l | tr -d ' ')" -gt 1 ]; then
+  count="$(protocol_output_count)"
+  if [ "$count" -gt 1 ]; then
     multi=1
   fi
   while IFS= read -r proto; do
@@ -1532,7 +1483,7 @@ remove_mita_common() {
       ;;
   esac
   run rm -f /var/log/mita.log /var/log/mita.err
-  run rm -f /root/mieru_client_*.json 2>/dev/null || true
+  run rm -f /root/mieru_client_*.json /root/mieru_client_tcp_*.json /root/mieru_client_udp_*.json 2>/dev/null || true
   run rm -rf /etc/mita /var/lib/mita /var/run/mita /var/run/mita.sock
   run rm -f "$MITA_BIN" /usr/bin/mita "$MITA_MARKER" "$OPENRC_SVC"
   run rm -f /lib/systemd/system/mita.service /usr/lib/systemd/system/mita.service "$SYSTEMD_SVC"
@@ -1632,8 +1583,7 @@ do_client_config() {
 }
 
 show_menu() {
-  msg ""
-  t 'mieru mita 服务端一键安装' 'mieru mita server one-click installer'
+  print_banner
   msg "  1) 安装 / 配置"
   msg "  2) 升级"
   msg "  3) 卸载"
@@ -1655,8 +1605,12 @@ show_menu() {
 }
 
 main() {
+  local from_menu=0
   if [ -z "$ACTION" ]; then
     show_menu
+    from_menu=1
+  elif [ "$ACTION" != "menu" ]; then
+    print_banner
   fi
   case "$ACTION" in
     install) do_install ;;
