@@ -8,9 +8,20 @@
 
 ## 一键安装
 
+**Debian / Ubuntu / CentOS / RHEL 等**（需 sudo）：
+
 ```sh
 curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-mita.sh | sudo bash
 ```
+
+**Alpine Linux**（默认无 `sudo`，且需先安装 `bash`）：
+
+```sh
+apk add --no-cache bash curl && \
+  curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-mita.sh | bash
+```
+
+> Alpine 容器内通常已是 root，**不要**加 `sudo`；脚本本身会 `apk add` 其余依赖（tar、iptables 等）。
 
 运行后按菜单选择「安装 / 配置」，脚本将：
 
@@ -20,6 +31,11 @@ curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-
 4. 尝试放行防火墙（ufw / firewalld / Alpine iptables）
 5. 安装完成**同时输出** `mierus://` 节点链接、客户端 JSON、**Clash/mihomo 片段**及连接信息摘要
 6. 下载包 **SHA256 校验**；提示云安全组放行端口
+
+### v1.2.10 增强
+
+- 文档与 `--help` 补充 **Alpine 一键命令**（`apk add bash curl` + `| bash`，无需 sudo）
+- 非 bash / 非 root 时给出 Alpine 专用提示
 
 ### v1.2.9 修复
 
@@ -78,6 +94,14 @@ curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-
 ### Alpine 说明
 
 Alpine 使用官方 `mita_*_linux_{amd64,arm64}.tar.gz`，自动安装 OpenRC 或 systemd 服务，并通过 iptables 放行端口。架构：amd64 / arm64。
+
+常见报错与处理：
+
+| 报错 | 原因 | 处理 |
+|------|------|------|
+| `sudo: not found` | Alpine 默认无 sudo | 去掉 `sudo`，直接 `\| bash`（root 环境） |
+| `请使用 bash 运行` | 默认 shell 为 ash | 先 `apk add --no-cache bash curl` |
+| `curl: (23) Failure writing` | 管道下游命令失败 | 同上，确保 `bash` 已安装 |
 
 ## 非交互安装
 

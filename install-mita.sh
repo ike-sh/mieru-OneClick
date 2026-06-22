@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.9"
+SCRIPT_VERSION="1.2.10"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -39,7 +39,14 @@ CLIENT_SOCKS5_PORT=1080
 CLIENT_HTTP_PORT=8080
 
 if [ -z "${BASH_VERSION:-}" ]; then
-  echo "[错误] 请使用 bash 运行此脚本，例如: curl ... | sudo bash" >&2
+  echo "[错误] 请使用 bash 运行此脚本" >&2
+  if [ -f /etc/alpine-release ]; then
+    echo "Alpine 默认无 bash，请先安装后执行（root 无需 sudo）：" >&2
+    echo "  apk add --no-cache bash curl" >&2
+    echo "  curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-mita.sh | bash" >&2
+  else
+    echo "  curl -fsSL .../install-mita.sh | sudo bash" >&2
+  fi
   exit 1
 fi
 
@@ -80,8 +87,15 @@ mieru mita 服务端一键安装 ${SCRIPT_VERSION}
   --help, -h          显示帮助
   --version           显示版本
 
-一键安装（交互式）：
+一键安装（交互式，Debian/Ubuntu/CentOS 等）：
   curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-mita.sh | sudo bash
+
+Alpine Linux（无 sudo，需先装 bash）：
+  apk add --no-cache bash curl
+  curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-mita.sh | bash
+
+Alpine 一行命令：
+  apk add --no-cache bash curl && curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-mita.sh | bash
 
 非交互示例：
   curl -fsSL .../install-mita.sh | sudo bash -s -- --install -y --port 2088 --user alice --password 'secret'
@@ -218,7 +232,14 @@ confirm() {
 
 require_root() {
   STAGE="权限检查"
-  [ "$(id -u)" -eq 0 ] || die "$(t '需要 root 权限，请使用 sudo 运行' 'Root privileges required; run with sudo')"
+  if [ "$(id -u)" -eq 0 ]; then
+    return 0
+  fi
+  if [ -f /etc/alpine-release ]; then
+    die "$(t '需要 root 权限；Alpine 请 su - 或 docker exec -u root 后直接 bash 运行（无 sudo）' \
+      'Root required; on Alpine use su - or docker exec -u root, then run with bash (no sudo)')"
+  fi
+  die "$(t '需要 root 权限，请使用 sudo 运行' 'Root privileges required; run with sudo')"
 }
 
 require_linux() {
