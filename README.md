@@ -32,6 +32,12 @@ apk add --no-cache bash curl && \
 5. 安装完成**同时输出** `mierus://` 节点链接、客户端 JSON、**Clash/mihomo 片段**及连接信息摘要
 6. 下载包 **SHA256 校验**；提示云安全组放行端口
 
+### v1.2.12 修复
+
+- Alpine/OpenRC：`/etc/mita` 授权 `mita:mita`（守护进程需写入 `server.conf.pb`，否则启动即退出）
+- OpenRC 服务增加 `start_pre` + `checkpath`，确保运行时目录存在
+- 套接字等待失败时输出 `/var/log/mita.err` 日志尾部
+
 ### v1.2.11 修复
 
 - 修复 Alpine/BusyBox `mktemp: Invalid argument`（`XXXXXX` 必须在模板末尾）

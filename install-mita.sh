@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.11"
+SCRIPT_VERSION="1.2.12"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -573,8 +573,10 @@ ensure_mita_account() {
       run adduser -S -G mita -s /sbin/nologin -h /var/lib/mita mita
     fi
   fi
-  run mkdir -p /etc/mita /var/lib/mita /var/run/mita
-  run chown -R mita:mita /var/lib/mita /var/run/mita 2>/dev/null || true
+  run mkdir -p /etc/mita /var/lib/mita /var/run/mita /run/mita
+  run chown -R mita:mita /etc/mita /var/lib/mita /var/run/mita /run/mita 2>/dev/null || true
+  run chmod 0750 /etc/mita
+  run chmod 0755 /var/lib/mita /var/run/mita /run/mita
 }
 
 install_mita_systemd() {
@@ -617,10 +619,17 @@ command_background="yes"
 pidfile="/run/\${RC_SVCNAME}.pid"
 output_log="/var/log/mita.log"
 error_log="/var/log/mita.err"
+directory="/var/lib/mita"
 
 depend() {
-    need net
+    need net localmount
     after firewall
+}
+
+start_pre() {
+    checkpath --directory --owner mita:mita --mode 0750 /etc/mita
+    checkpath --directory --owner mita:mita --mode 0755 /var/lib/mita /var/run/mita /run/mita
+    checkpath --file --owner mita:mita --mode 0644 /var/log/mita.log /var/log/mita.err
 }
 EOF
   run chmod 0755 "$OPENRC_SVC"
@@ -841,7 +850,19 @@ EOF
 }
 
 mita_socket_paths() {
-  printf '%s\n' /run/mita/mita.sock /var/run/mita/mita.sock /var/run/mita.sock
+  printf '%s\n' /var/run/mita/mita.sock /run/mita/mita.sock /var/run/mita.sock
+}
+
+mita_log_tail() {
+  local f
+  for f in /var/log/mita.err /var/log/mita.log; do
+    if [ -s "$f" ]; then
+      warn "$(t "mita 日志 (${f}):" "mita log (${f}):")"
+      tail -n 8 "$f" 2>/dev/null | while IFS= read -r line; do
+        msg "  $line"
+      done
+    fi
+  done
 }
 
 wait_mita_socket() {
@@ -866,7 +887,11 @@ ensure_mita_daemon() {
       ;;
     openrc)
       run rc-update add mita default 2>/dev/null || true
-      run rc-service mita start 2>/dev/null || run rc-service mita restart 2>/dev/null || true
+      run rc-service mita restart 2>/dev/null || run rc-service mita start 2>/dev/null || true
+      sleep 2
+      if ! rc-service mita status 2>/dev/null | grep -q started; then
+        mita_log_tail
+      fi
       ;;
     *)
       run "$(mita_bin)" run >/dev/null 2>&1 &
@@ -883,6 +908,7 @@ apply_config() {
   if ! wait_mita_socket 45; then
     warn "$(t 'mita 管理进程未就绪，正在重试 apply config...' \
       'mita management daemon not ready, retrying apply config...')"
+    mita_log_tail
   fi
   for attempt in 1 2 3 4 5; do
     if "$bin" apply config "$cfg" 2>/dev/null; then
@@ -1161,6 +1187,7 @@ start_mita() {
   if ! wait_mita_socket 45; then
     warn "$(t 'mita 管理套接字未就绪，继续尝试 start...' \
       'mita management socket not ready, retrying start...')"
+    mita_log_tail
   fi
   for attempt in 1 2 3 4 5; do
     if "$bin" start 2>/dev/null; then
