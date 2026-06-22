@@ -3,7 +3,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.1.1"
+SCRIPT_VERSION="1.1.2"
 UPSTREAM_REPO="enfein/mieru"
 GITHUB_API="https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"
 GITHUB_DL="https://github.com/${UPSTREAM_REPO}/releases/download"
@@ -11,7 +11,7 @@ MITA_BIN="/usr/local/bin/mita"
 MITA_MARKER="/etc/mita/.mieru-oneclick"
 MITA_STATE="/etc/mita/install-state.env"
 INSTALL_SCRIPT_PATH="/usr/local/bin/install-mita"
-SCRIPT_REPO_RAW="https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-mita.sh"
+SCRIPT_REPO_RAW="https://raw.githubusercontent.com/ike-sh/mieru-OneClick/v${SCRIPT_VERSION}/install-mita.sh"
 OPENRC_SVC="/etc/init.d/mita"
 SYSTEMD_SVC="/etc/systemd/system/mita.service"
 
@@ -28,6 +28,17 @@ PROTOCOL="TCP"
 USERNAME=""
 PASSWORD=""
 OP_USER=""
+
+if [ -z "${BASH_VERSION:-}" ]; then
+  echo "[错误] 请使用 bash 运行此脚本，例如: curl ... | sudo bash" >&2
+  exit 1
+fi
+
+on_error() {
+  msg "[错误] 步骤失败: ${STAGE}" >&2
+  exit 1
+}
+trap on_error ERR
 
 usage() {
   cat <<EOF
@@ -371,7 +382,7 @@ download_package() {
 
 install_alpine_deps() {
   STAGE="安装 Alpine 依赖"
-  run apk add --no-cache curl tar ca-certificates iptables
+  run apk add --no-cache bash curl tar ca-certificates iptables
   if [ "$(service_manager)" = openrc ]; then
     run apk add --no-cache openrc 2>/dev/null || true
   fi
@@ -755,6 +766,21 @@ start_mita() {
   esac
 }
 
+verify_mita_running() {
+  STAGE="验证服务状态"
+  local bin status_out
+  bin="$(mita_bin)"
+  sleep 2
+  status_out="$("$bin" status 2>/dev/null || true)"
+  if printf '%s' "$status_out" | grep -q 'RUNNING'; then
+    t 'mita 服务运行正常' 'mita service is running'
+    return 0
+  fi
+  warn "$(t 'mita 可能未处于 RUNNING 状态，请执行: mita status' \
+    'mita may not be RUNNING; check: mita status')"
+  msg "$status_out"
+}
+
 add_op_user() {
   local u="$1"
   [ -n "$u" ] || return 0
@@ -858,6 +884,9 @@ print_summary() {
     fi
     msg ""
     build_client_json "$ip"
+  else
+    warn "$(t '未能获取公网 IP，请手动将下方连接信息填入客户端' \
+      'Could not detect public IP; use connection info below manually')"
   fi
   msg ""
   t '【连接信息】' '[Connection info]'
@@ -927,6 +956,7 @@ do_install() {
   apply_config "$cfg"
   open_firewall
   start_mita
+  verify_mita_running
   install_self_script
   save_install_state
 
@@ -958,12 +988,13 @@ do_upgrade() {
   download_package "$url" "$tmp"
   install_package "$tmp" "$pm"
   rm -f "$tmp"
+  install_self_script
   run "$(mita_bin)" reload 2>/dev/null || start_mita
+  verify_mita_running
   t "已升级至 ${ver}" "Upgraded to ${ver}"
 }
 
 remove_mita_common() {
-  local pm="$1"
   local bin
   bin="$(mita_bin)"
   run "$bin" stop 2>/dev/null || true
@@ -1006,7 +1037,7 @@ do_uninstall() {
     rpm) run rpm -e mita 2>/dev/null || true ;;
     alpine) ;;
   esac
-  remove_mita_common "$pm"
+  remove_mita_common
   t 'mita 及安装脚本已完全卸载' 'mita and install script fully removed'
 }
 

@@ -42,10 +42,10 @@ curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-
 |------|------|
 | `--upgrade` | 升级至最新版 |
 | `--uninstall` | 卸载 mita、管理脚本、防火墙规则、客户端配置与日志 |
-
-卸载后再次管理请重新执行一键安装，或运行 `install-mita --help`（安装后位于 `/usr/local/bin/install-mita`）。
 | `--status` | 查看服务与配置 |
 | `--client-config` | 根据当前服务端配置生成客户端 JSON |
+
+卸载后再次管理请重新执行一键安装，或运行 `install-mita --help`（安装后位于 `/usr/local/bin/install-mita`）。
 
 ## 与官方脚本的关系
 
