@@ -21,6 +21,12 @@ curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-
 5. 安装完成**同时输出** `mierus://` 节点链接、客户端 JSON、**Clash/mihomo 片段**及连接信息摘要
 6. 下载包 **SHA256 校验**；提示云安全组放行端口
 
+### v1.2.9 修复
+
+- 修复 deb 安装后 `mita.sock` 未就绪导致 `mita start` 失败、脚本中断（`set -e`）
+- 新增 `wait_mita_socket` / `ensure_mita_daemon`：先启 systemd 守护进程，等待 RPC 套接字后再 `apply` / `start`
+- `mita start` 改为重试 + 警告，不再因单次失败退出安装
+
 ### v1.2.8 增强
 
 - 交互菜单顶部显示 **版本号 v1.2.8** 与 **作者 ike**

@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.8"
+SCRIPT_VERSION="1.2.9"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -798,10 +798,60 @@ EOF
   printf '%s' "$cfg"
 }
 
+mita_socket_paths() {
+  printf '%s\n' /run/mita/mita.sock /var/run/mita/mita.sock /var/run/mita.sock
+}
+
+wait_mita_socket() {
+  local timeout="${1:-45}" i=0 sock
+  while [ "$i" -lt "$timeout" ]; do
+    while IFS= read -r sock; do
+      [ -S "$sock" ] 2>/dev/null && return 0
+    done < <(mita_socket_paths)
+    sleep 1
+    i=$((i + 1))
+  done
+  return 1
+}
+
+ensure_mita_daemon() {
+  local sm
+  sm="$(service_manager)"
+  case "$sm" in
+    systemd)
+      run systemctl enable mita 2>/dev/null || true
+      run systemctl start mita 2>/dev/null || run systemctl restart mita 2>/dev/null || true
+      ;;
+    openrc)
+      run rc-update add mita default 2>/dev/null || true
+      run rc-service mita start 2>/dev/null || run rc-service mita restart 2>/dev/null || true
+      ;;
+    *)
+      run "$(mita_bin)" run >/dev/null 2>&1 &
+      ;;
+  esac
+}
+
 apply_config() {
   local cfg="$1"
   STAGE="应用配置"
-  run "$(mita_bin)" apply config "$cfg"
+  local bin attempt
+  bin="$(mita_bin)"
+  ensure_mita_daemon
+  if ! wait_mita_socket 45; then
+    warn "$(t 'mita 管理进程未就绪，正在重试 apply config...' \
+      'mita management daemon not ready, retrying apply config...')"
+  fi
+  for attempt in 1 2 3 4 5; do
+    if "$bin" apply config "$cfg" 2>/dev/null; then
+      rm -f "$cfg"
+      return 0
+    fi
+    ensure_mita_daemon
+    wait_mita_socket 10 || true
+    sleep 2
+  done
+  "$bin" apply config "$cfg" || die "$(t '应用配置失败' 'Failed to apply config')"
   rm -f "$cfg"
 }
 
@@ -1058,40 +1108,49 @@ public_ip() {
 
 start_mita() {
   STAGE="启动服务"
-  local sm bin
+  local sm bin attempt
   sm="$(service_manager)"
   bin="$(mita_bin)"
-  run "$bin" stop 2>/dev/null || true
-  sleep 1
-  case "$sm" in
-    systemd)
-      run systemctl enable mita 2>/dev/null || true
-      run systemctl restart mita 2>/dev/null || true
-      ;;
-    openrc)
-      run rc-update add mita default 2>/dev/null || true
-      run rc-service mita restart 2>/dev/null || true
-      ;;
-  esac
-  run "$bin" start
+  if wait_mita_socket 1; then
+    "$bin" stop 2>/dev/null || true
+    sleep 1
+  fi
+  ensure_mita_daemon
+  if ! wait_mita_socket 45; then
+    warn "$(t 'mita 管理套接字未就绪，继续尝试 start...' \
+      'mita management socket not ready, retrying start...')"
+  fi
+  for attempt in 1 2 3 4 5; do
+    if "$bin" start 2>/dev/null; then
+      sleep 1
+      return 0
+    fi
+    ensure_mita_daemon
+    wait_mita_socket 10 || true
+    sleep 2
+  done
+  warn "$(t 'mita start 未成功，请手动执行: systemctl restart mita && mita start' \
+    'mita start failed; run: systemctl restart mita && mita start')"
 }
 
 verify_mita_running() {
   STAGE="验证服务状态"
   local bin status_out attempt
   bin="$(mita_bin)"
-  for attempt in 1 2 3; do
+  for attempt in 1 2 3 4 5; do
     sleep 2
     status_out="$("$bin" status 2>/dev/null || true)"
     if printf '%s' "$status_out" | grep -q 'status is "RUNNING"'; then
       t 'mita 服务运行正常' 'mita service is running'
       return 0
     fi
-    run "$bin" start 2>/dev/null || true
+    ensure_mita_daemon
+    wait_mita_socket 10 || true
+    "$bin" start 2>/dev/null || true
   done
-  warn "$(t 'mita 未处于 RUNNING 状态，请执行: mita status && mita start' \
-    'mita is not RUNNING; run: mita status && mita start')"
-  msg "$status_out"
+  warn "$(t 'mita 未处于 RUNNING 状态，请执行: systemctl restart mita && mita status && mita start' \
+    'mita is not RUNNING; run: systemctl restart mita && mita status && mita start')"
+  [ -n "$status_out" ] && msg "$status_out"
 }
 
 add_op_user() {
@@ -1424,6 +1483,8 @@ do_install() {
   download_package "$url" "$tmp"
   install_package "$tmp" "$pm"
   rm -f "$tmp"
+  ensure_mita_daemon
+  wait_mita_socket 30 || true
 
   add_op_user "$OP_USER"
   cfg="$(write_server_config)"
