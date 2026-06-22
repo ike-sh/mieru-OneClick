@@ -3,7 +3,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.1.2"
+SCRIPT_VERSION="1.2.0"
 UPSTREAM_REPO="enfein/mieru"
 GITHUB_API="https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"
 GITHUB_DL="https://github.com/${UPSTREAM_REPO}/releases/download"
@@ -254,7 +254,18 @@ PORT=${PORT}
 PORT_RANGE=${PORT_RANGE}
 PROTOCOL=${PROTOCOL}
 INSTALL_SCRIPT=${INSTALL_SCRIPT_PATH}
+INSTALL_METHOD=oneclick
 EOF
+  run touch "$MITA_MARKER"
+}
+
+mark_oneclick_install() {
+  run mkdir -p /etc/mita
+  run touch "$MITA_MARKER"
+}
+
+installed_by_oneclick() {
+  [ -f "$MITA_MARKER" ]
 }
 
 load_install_state() {
@@ -378,6 +389,35 @@ download_package() {
   info "$(t "下载 ${url}" "Downloading ${url}")"
   run curl -fL --connect-timeout 30 --retry 3 --retry-delay 2 -o "$dest" "$url"
   [ -s "$dest" ] || die "$(t '下载文件为空' 'Downloaded file is empty')"
+  verify_package_sha256 "$dest" "${url}.sha256.txt"
+}
+
+verify_package_sha256() {
+  local file="$1"
+  local sha_url="$2"
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  STAGE="校验安装包 SHA256"
+  local sha_file expected actual
+  sha_file="$(mktemp /tmp/mita_sha_XXXXXX.txt)"
+  if ! curl -fsSL --connect-timeout 15 --max-time 30 "$sha_url" -o "$sha_file" 2>/dev/null; then
+    warn "$(t "无法下载校验文件，已跳过: ${sha_url}" "Checksum file unavailable, skipped: ${sha_url}")"
+    rm -f "$sha_file"
+    return 0
+  fi
+  expected="$(awk '{print $1}' "$sha_file" | head -n1)"
+  [ -n "$expected" ] || die "$(t '校验文件格式无效' 'Invalid checksum file')"
+  if command -v sha256sum >/dev/null 2>&1; then
+    actual="$(sha256sum "$file" | awk '{print $1}')"
+  elif command -v shasum >/dev/null 2>&1; then
+    actual="$(shasum -a 256 "$file" | awk '{print $1}')"
+  else
+    warn "$(t '未找到 sha256sum/shasum，跳过完整性校验' 'sha256sum/shasum not found, skipping verify')"
+    rm -f "$sha_file"
+    return 0
+  fi
+  rm -f "$sha_file"
+  [ "$expected" = "$actual" ] || die "$(t '安装包 SHA256 校验失败' 'Package SHA256 verification failed')"
+  t '安装包 SHA256 校验通过' 'Package SHA256 verified'
 }
 
 install_alpine_deps() {
@@ -486,8 +526,14 @@ install_package() {
   local pm="$2"
   STAGE="安装软件包"
   case "$pm" in
-    deb) run dpkg -i "$path" ;;
-    rpm) run rpm -Uvh --force "$path" ;;
+    deb)
+      run dpkg -i "$path"
+      mark_oneclick_install
+      ;;
+    rpm)
+      run rpm -Uvh --force "$path"
+      mark_oneclick_install
+      ;;
     alpine)
       install_alpine_deps
       ensure_mita_account
@@ -641,21 +687,69 @@ collect_ports_from_mita() {
   PROTOCOL="${PROTOCOL:-TCP}"
 }
 
+ufw_rule_spec() {
+  local p="$1"
+  local proto="$2"
+  if [[ "$p" == *-* ]]; then
+    local start="${p%-*}"
+    local end="${p#*-}"
+    printf '%s:%s/%s' "$start" "$end" "$proto"
+  else
+    printf '%s/%s' "$p" "$proto"
+  fi
+}
+
+iptables_accept_port() {
+  local p="$1"
+  local proto="$2"
+  local action="${3:-add}"
+  if [[ "$p" == *-* ]]; then
+    local start end port
+    start="${p%-*}"
+    end="${p#*-}"
+    port="$start"
+    while [ "$port" -le "$end" ]; do
+      if [ "$action" = add ]; then
+        run iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null \
+          || run iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT || true
+      else
+        run iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
+      fi
+      port=$((port + 1))
+    done
+  else
+    if [ "$action" = add ]; then
+      run iptables -C INPUT -p "$proto" --dport "$p" -j ACCEPT 2>/dev/null \
+        || run iptables -I INPUT -p "$proto" --dport "$p" -j ACCEPT || true
+    else
+      run iptables -D INPUT -p "$proto" --dport "$p" -j ACCEPT 2>/dev/null || true
+    fi
+  fi
+}
+
+persist_iptables_rules() {
+  if [ -d /etc/iptables ] || [ -f /etc/alpine-release ]; then
+    run mkdir -p /etc/iptables
+    run iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
+  fi
+}
+
 open_firewall() {
   STAGE="配置防火墙"
-  local ports=() proto
+  local ports=() proto handled=0
   proto="$(proto_lower "$PROTOCOL")"
   if [ -n "$PORT" ]; then
     ports+=("$PORT")
   elif [ -n "$PORT_RANGE" ]; then
     ports+=("$PORT_RANGE")
   fi
+  [ "${#ports[@]}" -gt 0 ] || return 0
 
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
     for p in "${ports[@]}"; do
-      run ufw allow "${p}/${proto}" || true
+      run ufw allow "$(ufw_rule_spec "$p" "$proto")" || true
     done
-    return
+    handled=1
   fi
 
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
@@ -663,30 +757,20 @@ open_firewall() {
       run firewall-cmd --permanent --add-port="${p}/${proto}" || true
     done
     run firewall-cmd --reload || true
-    return
+    handled=1
   fi
 
-  if [ -f /etc/alpine-release ] && command -v iptables >/dev/null 2>&1; then
+  if command -v iptables >/dev/null 2>&1; then
     for p in "${ports[@]}"; do
-      if [[ "$p" == *-* ]]; then
-        local start end port
-        start="${p%-*}"
-        end="${p#*-}"
-        port="$start"
-        while [ "$port" -le "$end" ]; do
-          run iptables -C INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null \
-            || run iptables -I INPUT -p "$proto" --dport "$port" -j ACCEPT || true
-          port=$((port + 1))
-        done
-      else
-        run iptables -C INPUT -p "$proto" --dport "$p" -j ACCEPT 2>/dev/null \
-          || run iptables -I INPUT -p "$proto" --dport "$p" -j ACCEPT || true
-      fi
+      iptables_accept_port "$p" "$proto" add
     done
-    if [ -d /etc/iptables ]; then
-      run mkdir -p /etc/iptables
-      run iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    fi
+    persist_iptables_rules
+    handled=1
+  fi
+
+  if [ "$handled" -eq 0 ]; then
+    warn "$(t '未检测到本地防火墙工具，请仅在云安全组放行端口' \
+      'No local firewall tool found; open ports in cloud security group')"
   fi
 }
 
@@ -704,9 +788,8 @@ close_firewall() {
 
   if command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -q 'Status: active'; then
     for p in "${ports[@]}"; do
-      run ufw delete allow "${p}/${proto}" 2>/dev/null || true
+      run ufw delete allow "$(ufw_rule_spec "$p" "$proto")" 2>/dev/null || true
     done
-    return
   fi
 
   if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
@@ -714,28 +797,27 @@ close_firewall() {
       run firewall-cmd --permanent --remove-port="${p}/${proto}" 2>/dev/null || true
     done
     run firewall-cmd --reload 2>/dev/null || true
-    return
   fi
 
   if command -v iptables >/dev/null 2>&1; then
     for p in "${ports[@]}"; do
-      if [[ "$p" == *-* ]]; then
-        local start end port
-        start="${p%-*}"
-        end="${p#*-}"
-        port="$start"
-        while [ "$port" -le "$end" ]; do
-          run iptables -D INPUT -p "$proto" --dport "$port" -j ACCEPT 2>/dev/null || true
-          port=$((port + 1))
-        done
-      else
-        run iptables -D INPUT -p "$proto" --dport "$p" -j ACCEPT 2>/dev/null || true
-      fi
+      iptables_accept_port "$p" "$proto" del
     done
-    if [ -d /etc/iptables ]; then
-      run iptables-save > /etc/iptables/rules.v4 2>/dev/null || true
-    fi
+    persist_iptables_rules
   fi
+}
+
+cloud_firewall_hint() {
+  local spec=""
+  if [ -n "$PORT" ]; then
+    spec="${PORT}/${PROTOCOL}"
+  elif [ -n "$PORT_RANGE" ]; then
+    spec="${PORT_RANGE}/${PROTOCOL}"
+  fi
+  [ -n "$spec" ] || return 0
+  msg ""
+  t "【云安全组提醒】请在 VPS/云控制台安全组放行: ${spec}" \
+    "[Cloud SG] Allow in provider firewall: ${spec}"
 }
 
 public_ip() {
@@ -799,6 +881,9 @@ add_op_user() {
 
 enable_tcp_bbr() {
   STAGE="启用 TCP BBR"
+  if [ -f /etc/alpine-release ] && ! command -v python3 >/dev/null 2>&1; then
+    run apk add --no-cache python3 2>/dev/null || true
+  fi
   local url="https://raw.githubusercontent.com/${UPSTREAM_REPO}/refs/heads/main/tools/enable_tcp_bbr.py"
   local tmp
   tmp="$(mktemp /tmp/enable_bbr_XXXXXX.py)"
@@ -812,15 +897,53 @@ enable_tcp_bbr() {
   rm -f "$tmp"
 }
 
+urlencode() {
+  local value="$1"
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -c 'import sys, urllib.parse; print(urllib.parse.quote(sys.argv[1], safe=""))' "$value"
+    return 0
+  fi
+  if [[ "$value" =~ ^[a-zA-Z0-9._~-]+$ ]]; then
+    printf '%s' "$value"
+    return 0
+  fi
+  die "$(t '密码含特殊字符时需要 python3 以生成节点链接' \
+    'python3 required to encode special characters in share link')"
+}
+
 generate_share_link() {
   local ip="$1"
-  local query="profile=default&mtu=1400&handshake-mode=HANDSHAKE_STANDARD"
+  local enc_user enc_pass query
+  enc_user="$(urlencode "$USERNAME")"
+  enc_pass="$(urlencode "$PASSWORD")"
+  query="profile=default&mtu=1400&handshake-mode=HANDSHAKE_STANDARD"
   if [ -n "$PORT" ]; then
     query="${query}&port=${PORT}&protocol=${PROTOCOL}"
   else
     query="${query}&port=${PORT_RANGE}&protocol=${PROTOCOL}"
   fi
-  printf 'mierus://%s:%s@%s?%s' "$USERNAME" "$PASSWORD" "$ip" "$query"
+  printf 'mierus://%s:%s@%s?%s' "$enc_user" "$enc_pass" "$ip" "$query"
+}
+
+build_clash_yaml() {
+  local ip="$1"
+  local port_lines
+  if [ -n "$PORT" ]; then
+    port_lines="    port: ${PORT}"
+  else
+    port_lines="    port-range: ${PORT_RANGE}"
+  fi
+  cat <<EOF
+proxies:
+  - name: mieru-mita
+    type: mieru
+    server: ${ip}
+${port_lines}
+    transport: ${PROTOCOL}
+    udp: true
+    username: ${USERNAME}
+    password: ${PASSWORD}
+EOF
 }
 
 build_client_json() {
@@ -903,6 +1026,12 @@ print_summary() {
   t '导入方式:' 'Import options:'
   msg '  mieru import config "<节点链接>"'
   msg '  mieru apply config /root/mieru_client_*.json'
+  if [ -n "$ip" ]; then
+    msg ""
+    t '【Clash / mihomo 配置片段】' '[Clash / mihomo snippet]'
+    build_clash_yaml "$ip"
+  fi
+  cloud_firewall_hint
 }
 
 generate_client_config() {
@@ -918,6 +1047,10 @@ generate_client_config() {
   msg "$link"
   msg ""
   cat "$cfg_path"
+  msg ""
+  t '【Clash / mihomo 配置片段】' '[Clash / mihomo snippet]'
+  build_clash_yaml "$ip"
+  cloud_firewall_hint
 }
 
 do_install() {
@@ -1027,6 +1160,11 @@ remove_mita_common() {
 do_uninstall() {
   require_root
   mita_installed || die "$(t 'mita 未安装' 'mita is not installed')"
+  if ! installed_by_oneclick; then
+    warn "$(t '未检测到本脚本安装标记；若仅使用官方 deb/rpm，卸载范围可能不同' \
+      'OneClick install marker not found; official package uninstall may differ')"
+    confirm '仍要继续卸载？[y/N]: ' 'Continue uninstall anyway? [y/N]: ' n || exit 0
+  fi
   confirm '确认卸载 mita、管理脚本及全部配置？[y/N]: ' \
     'Uninstall mita, manager script, and all config? [y/N]: ' n || exit 0
   local pm

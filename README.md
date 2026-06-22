@@ -18,7 +18,18 @@ curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-
 2. 自动生成随机用户名、密码；询问端口时默认随机端口（回车即用）
 3. 应用配置并启动服务
 4. 尝试放行防火墙（ufw / firewalld / Alpine iptables）
-5. 安装完成**同时输出** `mierus://` 节点链接、客户端 JSON 配置（保存至 `/root/mieru_client_*.json`）及连接信息摘要
+5. 安装完成**同时输出** `mierus://` 节点链接、客户端 JSON、**Clash/mihomo 片段**及连接信息摘要
+6. 下载包 **SHA256 校验**；提示云安全组放行端口
+
+### v1.2.0 增强
+
+- 安装包 SHA256 完整性校验
+- 节点链接 URL 编码（支持特殊字符密码）
+- Clash / mihomo YAML 片段输出
+- deb/rpm 系统 iptables 回退放行
+- ufw 端口段语法 `9000:9010/tcp`
+- Alpine 启用 BBR 时自动安装 python3
+- 本脚本安装标记，卸载前识别官方包
 
 ### Alpine 说明
 
