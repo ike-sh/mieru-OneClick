@@ -3,7 +3,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.2.1"
 UPSTREAM_REPO="enfein/mieru"
 GITHUB_API="https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"
 GITHUB_DL="https://github.com/${UPSTREAM_REPO}/releases/download"
@@ -366,6 +366,13 @@ installed_version() {
   fi
 }
 
+version_is_current() {
+  local current="$1"
+  local available="$2"
+  [ -n "$current" ] || return 1
+  [ "$(printf '%s\n%s' "$current" "$available" | sort -V | tail -n1)" = "$current" ]
+}
+
 package_url() {
   local ver="$1"
   local pm="$2"
@@ -527,7 +534,7 @@ install_package() {
   STAGE="安装软件包"
   case "$pm" in
     deb)
-      run dpkg -i "$path"
+      run dpkg -i "$path" || run apt-get install -f -y
       mark_oneclick_install
       ;;
     rpm)
@@ -595,6 +602,8 @@ collect_config_interactive() {
     read_tty input "$(t "监听端口 [${default_port}]: " "Listen port [${default_port}]: ")" || input=""
     PORT="${input:-$default_port}"
     valid_port "$PORT" || die "$(t '非法端口' 'Invalid port')"
+  elif [ -n "$PORT" ] && [ -n "$PORT_RANGE" ]; then
+    die "$(t '不能同时指定端口与端口段' 'Cannot set both port and port range')"
   fi
 
   if [ "$PROTOCOL" != "TCP" ] && [ "$PROTOCOL" != "UDP" ]; then
@@ -606,6 +615,8 @@ collect_config_interactive() {
 
 ensure_config_noninteractive() {
   STAGE="参数校验"
+  [ -n "$PORT" ] && [ -n "$PORT_RANGE" ] && \
+    die "$(t '--port 与 --port-range 不能同时使用' 'Cannot use --port and --port-range together')"
   [ -n "$USERNAME" ] || USERNAME="$(random_token)"
   [ -n "$PASSWORD" ] || PASSWORD="$(random_token)"
   if [ -z "$PORT" ] && [ -z "$PORT_RANGE" ]; then
@@ -736,7 +747,7 @@ persist_iptables_rules() {
 
 open_firewall() {
   STAGE="配置防火墙"
-  local ports=() proto handled=0
+  local ports=() proto
   proto="$(proto_lower "$PROTOCOL")"
   if [ -n "$PORT" ]; then
     ports+=("$PORT")
@@ -749,26 +760,17 @@ open_firewall() {
     for p in "${ports[@]}"; do
       run ufw allow "$(ufw_rule_spec "$p" "$proto")" || true
     done
-    handled=1
-  fi
-
-  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     for p in "${ports[@]}"; do
       run firewall-cmd --permanent --add-port="${p}/${proto}" || true
     done
     run firewall-cmd --reload || true
-    handled=1
-  fi
-
-  if command -v iptables >/dev/null 2>&1; then
+  elif command -v iptables >/dev/null 2>&1; then
     for p in "${ports[@]}"; do
       iptables_accept_port "$p" "$proto" add
     done
     persist_iptables_rules
-    handled=1
-  fi
-
-  if [ "$handled" -eq 0 ]; then
+  else
     warn "$(t '未检测到本地防火墙工具，请仅在云安全组放行端口' \
       'No local firewall tool found; open ports in cloud security group')"
   fi
@@ -790,16 +792,12 @@ close_firewall() {
     for p in "${ports[@]}"; do
       run ufw delete allow "$(ufw_rule_spec "$p" "$proto")" 2>/dev/null || true
     done
-  fi
-
-  if command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
+  elif command -v firewall-cmd >/dev/null 2>&1 && firewall-cmd --state >/dev/null 2>&1; then
     for p in "${ports[@]}"; do
       run firewall-cmd --permanent --remove-port="${p}/${proto}" 2>/dev/null || true
     done
     run firewall-cmd --reload 2>/dev/null || true
-  fi
-
-  if command -v iptables >/dev/null 2>&1; then
+  elif command -v iptables >/dev/null 2>&1; then
     for p in "${ports[@]}"; do
       iptables_accept_port "$p" "$proto" del
     done
@@ -1112,8 +1110,8 @@ do_upgrade() {
   ver="$(query_latest_version)"
   local cur
   cur="$(installed_version || true)"
-  if [ -n "$cur" ] && [ "$cur" = "$ver" ]; then
-    t "已是最新版本 ${ver}" "Already on latest version ${ver}"
+  if version_is_current "$cur" "$ver"; then
+    t "已是最新版本 ${cur}" "Already on latest version ${cur}"
     exit 0
   fi
   url="$(package_url "$ver" "$pm" "$arch")"
