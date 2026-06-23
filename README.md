@@ -32,6 +32,11 @@ apk add --no-cache bash curl && \
 5. 安装完成**同时输出** `mierus://` 节点链接、客户端 JSON、**Clash/mihomo 片段**及连接信息摘要
 6. 下载包 **SHA256 校验**；提示云安全组放行端口
 
+### v1.2.17 修复
+
+- 修复 `mita` 快捷命令报 `install: same file` 导致 wrapper 未安装（`install-mita` 自更新时跳过同路径拷贝）
+- 任意 `install-mita` 调用时自动检查并补装 `/usr/local/bin/mita` wrapper
+
 ### v1.2.16 增强
 
 - 「查看节点链接」输出增加分区标题与说明：标注 `mierus://` 为分享链接、JSON 为客户端配置及导入方式

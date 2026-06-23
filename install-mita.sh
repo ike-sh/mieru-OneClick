@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.16"
+SCRIPT_VERSION="1.2.17"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -430,19 +430,38 @@ load_install_state() {
 
 install_self_script() {
   STAGE="安装管理脚本"
-  if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
-    run install -m 0755 "${BASH_SOURCE[0]}" "$INSTALL_SCRIPT_PATH"
+  local main_url="https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-mita.sh"
+  if curl -fsSL --connect-timeout 15 --max-time 60 "$main_url" -o "$INSTALL_SCRIPT_PATH" 2>/dev/null; then
+    run chmod 0755 "$INSTALL_SCRIPT_PATH"
+  elif [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    local src_real dest_real
+    src_real="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || realpath "${BASH_SOURCE[0]}" 2>/dev/null || printf '%s' "${BASH_SOURCE[0]}")"
+    dest_real="$(readlink -f "$INSTALL_SCRIPT_PATH" 2>/dev/null || realpath "$INSTALL_SCRIPT_PATH" 2>/dev/null || printf '%s' "$INSTALL_SCRIPT_PATH")"
+    if [ "$src_real" != "$dest_real" ]; then
+      run install -m 0755 "${BASH_SOURCE[0]}" "$INSTALL_SCRIPT_PATH"
+    fi
   else
     run curl -fsSL "$SCRIPT_REPO_RAW" -o "$INSTALL_SCRIPT_PATH"
     run chmod 0755 "$INSTALL_SCRIPT_PATH"
   fi
+  install_mita_wrapper_force
   migrate_mita_binary_layout
   install_mita_shortcuts
+}
+
+install_mita_wrapper_force() {
+  if mita_installed || [ -f "$MITA_MARKER" ] || [ -x "$INSTALL_SCRIPT_PATH" ]; then
+    install_mita_wrapper
+  fi
 }
 
 ensure_management_scripts() {
   STAGE="更新管理脚本"
   install_self_script
+  if ! is_mita_wrapper "$MITA_BIN"; then
+    warn "$(t 'mita 快捷入口未就绪，正在安装...' 'mita shortcut missing, installing...')"
+    install_mita_wrapper_force
+  fi
 }
 
 install_mita_wrapper() {
@@ -454,8 +473,13 @@ MITA_REAL="/usr/local/bin/mita-real"
 [ -x "$MITA_REAL" ] || MITA_REAL="/usr/bin/mita"
 INSTALL_MITA="/usr/local/bin/install-mita"
 
-if [ $# -eq 0 ] && [ -x "$INSTALL_MITA" ]; then
-  exec "$INSTALL_MITA"
+if [ $# -eq 0 ]; then
+  if [ -x "$INSTALL_MITA" ]; then
+    exec "$INSTALL_MITA"
+  fi
+  echo "[错误] 未找到 install-mita，请先运行一键安装脚本" >&2
+  echo "  curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-mita.sh | bash" >&2
+  exit 1
 fi
 
 if [ $# -gt 0 ] && [ -x "$INSTALL_MITA" ]; then
@@ -486,9 +510,7 @@ migrate_mita_binary_layout() {
       install_mita_systemd
     fi
   fi
-  if mita_installed || [ -f "$MITA_MARKER" ]; then
-    install_mita_wrapper
-  fi
+  install_mita_wrapper_force
 }
 
 install_mita_shortcuts() {
@@ -2124,6 +2146,9 @@ show_menu() {
 }
 
 main() {
+  if [ "$(id -u 2>/dev/null || echo 1)" -eq 0 ] && mita_installed; then
+    migrate_mita_binary_layout 2>/dev/null || true
+  fi
   local from_menu=0
   if [ -z "$ACTION" ]; then
     show_menu
