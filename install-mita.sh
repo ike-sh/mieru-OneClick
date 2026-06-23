@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.17"
+SCRIPT_VERSION="1.2.18"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -450,6 +450,9 @@ install_self_script() {
 }
 
 install_mita_wrapper_force() {
+  if is_mita_wrapper "$MITA_BIN"; then
+    return 0
+  fi
   if mita_installed || [ -f "$MITA_MARKER" ] || [ -x "$INSTALL_SCRIPT_PATH" ]; then
     install_mita_wrapper
   fi
@@ -458,10 +461,6 @@ install_mita_wrapper_force() {
 ensure_management_scripts() {
   STAGE="更新管理脚本"
   install_self_script
-  if ! is_mita_wrapper "$MITA_BIN"; then
-    warn "$(t 'mita 快捷入口未就绪，正在安装...' 'mita shortcut missing, installing...')"
-    install_mita_wrapper_force
-  fi
 }
 
 install_mita_wrapper() {
@@ -500,7 +499,10 @@ EOF
 
 migrate_mita_binary_layout() {
   STAGE="迁移 mita 二进制布局"
-  if [ -f "$MITA_BIN" ] && [ ! -f "$MITA_REAL_BIN" ] && ! is_mita_wrapper "$MITA_BIN"; then
+  if [ -f "$MITA_REAL_BIN" ] && ! is_mita_elf_binary "$MITA_REAL_BIN"; then
+    run rm -f "$MITA_REAL_BIN"
+  fi
+  if [ -f "$MITA_BIN" ] && [ ! -f "$MITA_REAL_BIN" ] && is_mita_elf_binary "$MITA_BIN"; then
     run mv "$MITA_BIN" "$MITA_REAL_BIN"
     run rm -f /usr/bin/mita
     run ln -sf "$MITA_REAL_BIN" /usr/bin/mita-real 2>/dev/null || true
@@ -670,17 +672,23 @@ mita_installed() {
 }
 
 is_mita_wrapper() {
-  [ -f "$1" ] && head -n1 "$1" 2>/dev/null | grep -q 'mieru-OneClick mita wrapper'
+  [ -f "$1" ] || return 1
+  head -c 320 "$1" 2>/dev/null | grep -q 'mieru-OneClick mita wrapper'
+}
+
+is_mita_elf_binary() {
+  [ -f "$1" ] || return 1
+  [ "$(head -c 4 "$1" 2>/dev/null || true)" = $'\x7fELF' ]
 }
 
 mita_real_bin() {
-  if [ -x "$MITA_REAL_BIN" ]; then
+  if [ -x "$MITA_REAL_BIN" ] && is_mita_elf_binary "$MITA_REAL_BIN"; then
     printf '%s' "$MITA_REAL_BIN"
-  elif [ -x /usr/bin/mita ] && ! is_mita_wrapper /usr/bin/mita; then
+  elif [ -x /usr/bin/mita ] && is_mita_elf_binary /usr/bin/mita; then
     printf '%s' /usr/bin/mita
-  elif [ -x "$MITA_BIN" ] && ! is_mita_wrapper "$MITA_BIN"; then
+  elif [ -x "$MITA_BIN" ] && is_mita_elf_binary "$MITA_BIN"; then
     printf '%s' "$MITA_BIN"
-  elif command -v mita-real >/dev/null 2>&1; then
+  elif command -v mita-real >/dev/null 2>&1 && is_mita_elf_binary "$(command -v mita-real)"; then
     command -v mita-real
   else
     printf '%s' "$MITA_REAL_BIN"
@@ -2146,7 +2154,7 @@ show_menu() {
 }
 
 main() {
-  if [ "$(id -u 2>/dev/null || echo 1)" -eq 0 ] && mita_installed; then
+  if [ "$(id -u 2>/dev/null || echo 1)" -eq 0 ] && mita_installed && [ -z "${ACTION:-}" ]; then
     migrate_mita_binary_layout 2>/dev/null || true
   fi
   local from_menu=0

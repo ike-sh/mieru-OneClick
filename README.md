@@ -32,6 +32,12 @@ apk add --no-cache bash curl && \
 5. 安装完成**同时输出** `mierus://` 节点链接、客户端 JSON、**Clash/mihomo 片段**及连接信息摘要
 6. 下载包 **SHA256 校验**；提示云安全组放行端口
 
+### v1.2.18 修复
+
+- 修复 Debian 选 6 卡死/CPU 拉满：`is_mita_wrapper` 误对 ELF 二进制 `head -n1` 导致 grep 扫描整个文件
+- 修复 migrate 误将 wrapper 脚本当作二进制迁移到 `mita-real`
+- 仅对 ELF 二进制执行布局迁移；`mita-real` 若非二进制自动清理
+
 ### v1.2.17 修复
 
 - 修复 `mita` 快捷命令报 `install: same file` 导致 wrapper 未安装（`install-mita` 自更新时跳过同路径拷贝）
