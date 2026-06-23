@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.21"
+SCRIPT_VERSION="1.2.22"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -77,6 +77,9 @@ mieru mita 服务端一键安装 ${SCRIPT_VERSION}
   --uninstall         卸载 mita
   --status            查看运行状态与配置摘要
   --client-config     查看节点链接并生成客户端 JSON（同 --show）
+  --start             启动服务（守护进程 + 代理）
+  --stop              停止服务
+  --restart           重启服务（守护进程异常时一键恢复）
 
 安装选项：
   --yes, -y           跳过确认
@@ -99,6 +102,7 @@ mieru mita 服务端一键安装 ${SCRIPT_VERSION}
   install-mita status             查看状态
   install-mita reconfigure        重新配置
   install-mita show               查看节点链接
+  install-mita restart            重启服务（start/stop 同理）
   mita-menu                       同上（安装后可用）
   登录 shell 下输入 mita          管理子命令不区分大小写；mita start 等仍走官方二进制
 
@@ -159,7 +163,10 @@ while [ $# -gt 0 ]; do
     --uninstall) ACTION=uninstall ;;
     --status) ACTION=status ;;
     --client-config|--show) ACTION=client-config ;;
-    install|upgrade|uninstall|status|reconfigure|client-config|show|menu|配置|节点)
+    --start) ACTION=start ;;
+    --stop) ACTION=stop ;;
+    --restart) ACTION=restart ;;
+    install|upgrade|uninstall|status|reconfigure|client-config|show|menu|start|stop|restart|配置|节点)
       [ -z "$ACTION" ] && ACTION="$_arg_lc"
       [ "$_arg_lc" = show ] && ACTION=client-config
       [ "$_arg_lc" = menu ] && ACTION=""
@@ -2254,6 +2261,52 @@ do_client_config() {
   generate_client_config
 }
 
+do_start() {
+  require_root || return 1
+  mita_installed || bail "$(t 'mita 未安装，请先安装' 'mita is not installed')" || return 1
+  repair_mita_binary_paths 2>/dev/null || true
+  start_mita
+  verify_mita_running
+  t 'mita 服务已启动' 'mita service started'
+}
+
+do_stop() {
+  require_root || return 1
+  mita_installed || bail "$(t 'mita 未安装' 'mita is not installed')" || return 1
+  local bin sm
+  bin="$(mita_bin)"
+  sm="$(service_manager)"
+  STAGE="停止服务"
+  run "$bin" stop 2>/dev/null || true
+  case "$sm" in
+    systemd) run systemctl stop mita 2>/dev/null || true ;;
+    openrc) run rc-service mita stop 2>/dev/null || true ;;
+    *) true ;;
+  esac
+  sleep 1
+  t 'mita 服务已停止' 'mita service stopped'
+}
+
+do_restart() {
+  require_root || return 1
+  mita_installed || bail "$(t 'mita 未安装' 'mita is not installed')" || return 1
+  repair_mita_binary_paths 2>/dev/null || true
+  local sm
+  sm="$(service_manager)"
+  STAGE="重启服务"
+  case "$sm" in
+    systemd) run systemctl restart mita 2>/dev/null || true ;;
+    openrc)
+      run rc-service mita zap 2>/dev/null || true
+      run rc-service mita restart 2>/dev/null || run rc-service mita start 2>/dev/null || true
+      ;;
+    *) true ;;
+  esac
+  start_mita
+  verify_mita_running
+  t 'mita 服务已重启' 'mita service restarted'
+}
+
 menu_run_action() {
   local rc=0
   case "$ACTION" in
@@ -2263,6 +2316,9 @@ menu_run_action() {
     uninstall) do_uninstall; return 2 ;;
     status) do_status || rc=1 ;;
     client-config) do_client_config || rc=1 ;;
+    start) do_start || rc=1 ;;
+    stop) do_stop || rc=1 ;;
+    restart) do_restart || rc=1 ;;
     *) warn "$(t '未知操作' 'Unknown action')"; return 1 ;;
   esac
   return "$rc"
@@ -2310,16 +2366,19 @@ show_menu() {
   msg "  4) 卸载"
   msg "  5) 状态"
   msg "  6) 查看节点链接 / 客户端配置"
-  msg "  7) 退出"
+  msg "  7) 启动服务"
+  msg "  8) 停止服务"
+  msg "  9) 重启服务"
+  msg "  10) 退出"
   msg ""
   t '快捷命令: 直接输入 mita 打开菜单（不区分大小写）' \
     'Quick command: type mita to open menu (case-insensitive)'
   msg ""
   local choice=""
-  read_tty choice "$(t '请选择 [1-7]: ' 'Choose [1-7]: ')" || choice=""
+  read_tty choice "$(t '请选择 [1-10]: ' 'Choose [1-10]: ')" || choice=""
   choice="$(printf '%s' "$choice" | tr -d '[:space:]')"
   if [ -z "$choice" ]; then
-    warn "$(t '请输入 1-7' 'Enter 1-7')"
+    warn "$(t '请输入 1-10' 'Enter 1-10')"
     return 1
   fi
   case "$choice" in
@@ -2329,9 +2388,12 @@ show_menu() {
     4) ACTION=uninstall ;;
     5) ACTION=status ;;
     6) ACTION=client-config ;;
-    7) return 2 ;;
+    7) ACTION=start ;;
+    8) ACTION=stop ;;
+    9) ACTION=restart ;;
+    10) return 2 ;;
     *)
-      warn "$(t '无效选择，请输入 1-7' 'Invalid choice, enter 1-7')"
+      warn "$(t '无效选择，请输入 1-10' 'Invalid choice, enter 1-10')"
       return 1
       ;;
   esac
@@ -2356,6 +2418,9 @@ main() {
     uninstall) do_uninstall ;;
     status) do_status ;;
     client-config|show) do_client_config ;;
+    start) do_start ;;
+    stop) do_stop ;;
+    restart) do_restart ;;
     menu)
       menu_loop
       ;;
