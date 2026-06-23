@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.13"
+SCRIPT_VERSION="1.2.14"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -14,6 +14,8 @@ MITA_BIN="/usr/local/bin/mita"
 MITA_MARKER="/etc/mita/.mieru-oneclick"
 MITA_STATE="/etc/mita/install-state.env"
 INSTALL_SCRIPT_PATH="/usr/local/bin/install-mita"
+MITA_MENU_PATH="/usr/local/bin/mita-menu"
+MITA_PROFILE_D="/etc/profile.d/mita-oneclick.sh"
 SCRIPT_REPO_RAW="https://raw.githubusercontent.com/ike-sh/mieru-OneClick/v${SCRIPT_VERSION}/install-mita.sh"
 OPENRC_SVC="/etc/init.d/mita"
 SYSTEMD_SVC="/etc/systemd/system/mita.service"
@@ -65,11 +67,12 @@ mieru mita 服务端一键安装 ${SCRIPT_VERSION}
 支持系统：Debian/Ubuntu、RHEL/CentOS/Rocky、Alpine Linux
 
 无参数时显示交互菜单；非交互请指定动作：
-  --install           安装并配置 mita
+  --install           新装 mita（已安装时建议用 --reconfigure）
+  --reconfigure       修改端口 / 密码 / 协议（不重装二进制）
   --upgrade           升级 mita 至最新版
   --uninstall         卸载 mita
   --status            查看运行状态与配置摘要
-  --client-config     根据当前服务端配置生成客户端 JSON
+  --client-config     查看节点链接并生成客户端 JSON（同 --show）
 
 安装选项：
   --yes, -y           跳过确认
@@ -86,6 +89,14 @@ mieru mita 服务端一键安装 ${SCRIPT_VERSION}
   --dry-run           仅预览，不执行
   --help, -h          显示帮助
   --version           显示版本
+
+快捷命令（子命令不区分大小写）：
+  install-mita                    打开菜单
+  install-mita status             查看状态
+  install-mita reconfigure        重新配置
+  install-mita show               查看节点链接
+  mita-menu                       同上（安装后可用）
+  登录 shell 下输入 mita          管理子命令不区分大小写；mita start 等仍走官方二进制
 
 一键安装（交互式，Debian/Ubuntu/CentOS 等）：
   curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-mita.sh | sudo bash
@@ -126,12 +137,21 @@ print_banner() {
 }
 
 while [ $# -gt 0 ]; do
-  case "$1" in
+  _arg_lc="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$_arg_lc" in
     --install) ACTION=install ;;
+    --reconfigure) ACTION=reconfigure ;;
     --upgrade) ACTION=upgrade ;;
     --uninstall) ACTION=uninstall ;;
     --status) ACTION=status ;;
-    --client-config) ACTION=client-config ;;
+    --client-config|--show) ACTION=client-config ;;
+    install|upgrade|uninstall|status|reconfigure|client-config|show|menu|配置|节点)
+      [ -z "$ACTION" ] && ACTION="$_arg_lc"
+      [ "$_arg_lc" = show ] && ACTION=client-config
+      [ "$_arg_lc" = menu ] && ACTION=""
+      [ "$_arg_lc" = 配置 ] && ACTION=client-config
+      [ "$_arg_lc" = 节点 ] && ACTION=client-config
+      ;;
     --yes|-y) YES=1 ;;
     --dry-run) DRY_RUN=1 ;;
     --port)
@@ -171,10 +191,15 @@ while [ $# -gt 0 ]; do
       ;;
     --help|-h) usage; exit 0 ;;
     --version) echo "mieru-OneClick install-mita.sh ${SCRIPT_VERSION} by ${SCRIPT_AUTHOR}"; exit 0 ;;
-    *) die "未知参数：$1（使用 --help 查看帮助）" ;;
+    *)
+      if [[ "$1" == --* ]]; then
+        die "未知参数：$1（使用 --help 查看帮助）"
+      fi
+      ;;
   esac
   shift
 done
+unset _arg_lc
 
 run() {
   if [ "$DRY_RUN" -eq 1 ]; then
@@ -407,9 +432,66 @@ install_self_script() {
     run curl -fsSL "$SCRIPT_REPO_RAW" -o "$INSTALL_SCRIPT_PATH"
     run chmod 0755 "$INSTALL_SCRIPT_PATH"
   fi
+  install_mita_shortcuts
+}
+
+install_mita_shortcuts() {
+  STAGE="安装快捷命令"
+  cat >"$MITA_MENU_PATH" <<'EOF'
+#!/usr/bin/env bash
+# mieru-OneClick 管理快捷入口（子命令不区分大小写）
+IM="/usr/local/bin/install-mita"
+if [ ! -x "$IM" ]; then
+  echo "[错误] 未找到 install-mita，请先完成安装" >&2
+  exit 1
+fi
+if [ $# -eq 0 ]; then
+  exec "$IM"
+fi
+cmd="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+case "$cmd" in
+  install|upgrade|uninstall|status|reconfigure|client-config|show|menu|配置|节点)
+    set -- "$cmd" "${@:2}"
+    ;;
+esac
+exec "$IM" "$@"
+EOF
+  run chmod 0755 "$MITA_MENU_PATH"
+  cat >"$MITA_PROFILE_D" <<'EOF'
+# mieru-OneClick：登录 shell 下 mita 管理子命令不区分大小写
+mita() {
+  local mita_real="/usr/local/bin/mita"
+  local im="/usr/local/bin/install-mita"
+  if [ ! -x "$im" ]; then
+    command "$mita_real" "$@"
+    return $?
+  fi
+  if [ $# -eq 0 ]; then
+    "$im"
+    return $?
+  fi
+  local cmd
+  cmd="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$cmd" in
+    menu|install|upgrade|uninstall|status|reconfigure|client-config|show|配置|节点|help)
+      shift
+      "$im" "$cmd" "$@"
+      ;;
+    *)
+      command "$mita_real" "$@"
+      ;;
+  esac
+}
+EOF
+  run chmod 0644 "$MITA_PROFILE_D"
+}
+
+remove_mita_shortcuts() {
+  run rm -f "$MITA_MENU_PATH" "$MITA_PROFILE_D"
 }
 
 remove_self_script() {
+  remove_mita_shortcuts
   if [ -f "$INSTALL_SCRIPT_PATH" ]; then
     run rm -f "$INSTALL_SCRIPT_PATH"
     t "已删除管理脚本 ${INSTALL_SCRIPT_PATH}" "Removed manager script ${INSTALL_SCRIPT_PATH}"
@@ -812,6 +894,103 @@ collect_config_interactive() {
   fi
   msg ""
   t "已选协议: $(protocol_label)" "Selected protocol: $(protocol_label)"
+}
+
+load_config_from_mita() {
+  local desc bin bindings
+  bin="$(mita_bin)"
+  desc="$("$bin" describe config 2>/dev/null || true)"
+  [ -n "$desc" ] || die "$(t '无法读取服务端配置' 'Cannot read server config')"
+
+  USERNAME="$(printf '%s' "$desc" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  PASSWORD="$(printf '%s' "$desc" | sed -n 's/.*"password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  [ -n "$USERNAME" ] && [ -n "$PASSWORD" ] || die "$(t '配置中缺少用户信息' 'Missing user info in config')"
+
+  load_install_state
+  bindings="$(extract_bindings_from_describe "$desc")"
+  PORT=""
+  PORT_RANGE=""
+  if [ -n "$bindings" ]; then
+    local pp proto p has_tcp=0 has_udp=0 tcp_port=""
+    while IFS= read -r pp; do
+      [ -n "$pp" ] || continue
+      proto="${pp%%|*}"
+      p="${pp#*|}"
+      case "$proto" in
+        TCP)
+          has_tcp=1
+          if [[ "$p" =~ ^[0-9]+$ ]]; then
+            tcp_port="$p"
+          elif [[ "$p" == *-* ]]; then
+            PORT_RANGE="$p"
+          fi
+          ;;
+        UDP) has_udp=1 ;;
+      esac
+    done <<< "$bindings"
+    [ -n "$tcp_port" ] && PORT="$tcp_port"
+    if [ "$has_tcp" -gt 0 ] && [ "$has_udp" -gt 0 ]; then
+      PROTOCOL="BOTH"
+    elif [ "$has_udp" -gt 0 ]; then
+      PROTOCOL="UDP"
+    else
+      PROTOCOL="TCP"
+    fi
+  fi
+}
+
+collect_reconfigure_interactive() {
+  STAGE="重新配置"
+  load_config_from_mita
+  msg ""
+  t '【当前配置】' '[Current config]'
+  t "  用户名: ${USERNAME}" "  Username: ${USERNAME}"
+  t "  密码:   ${PASSWORD}" "  Password: ${PASSWORD}"
+  t "  协议:   $(protocol_label)" "  Protocol: $(protocol_label)"
+  if [ -n "$PORT" ]; then
+    t "  端口:   ${PORT}" "  Port:     ${PORT}"
+  else
+    t "  端口段: ${PORT_RANGE}" "  Port range: ${PORT_RANGE}"
+  fi
+  msg ""
+  t '留空则保持当前值' 'Press Enter to keep current value'
+
+  local input=""
+  read_tty input "$(t "新用户名 [${USERNAME}]: " "New username [${USERNAME}]: ")" || input=""
+  [ -n "$input" ] && USERNAME="$input"
+
+  input=""
+  read_tty input "$(t "新密码 [${PASSWORD}]: " "New password [${PASSWORD}]: ")" || input=""
+  [ -n "$input" ] && PASSWORD="$input"
+
+  if [ "$PROTOCOL_CLI" -eq 0 ]; then
+    msg ""
+    t '是否更改传输协议？' 'Change transport protocol?'
+    t '  1) 保持当前' '  1) Keep current'
+    t '  2) 重新选择' '  2) Choose again'
+    input=""
+    read_tty input "$(t '请选择 [1-2，默认 1]: ' 'Choose [1-2, default 1]: ')" || input="1"
+    input="${input:-1}"
+    if [ "$input" = "2" ]; then
+      choose_protocol_interactive
+    fi
+  fi
+
+  if [ -z "$PORT_RANGE" ]; then
+    msg ""
+    input=""
+    read_tty input "$(t "新监听端口 [${PORT}]: " "New listen port [${PORT}]: ")" || input=""
+    if [ -n "$input" ]; then
+      PORT="$input"
+      valid_port "$PORT" || die "$(t '非法端口' 'Invalid port')"
+    fi
+  fi
+
+  if [ "$PROTOCOL" = "BOTH" ] && [ -n "$PORT" ] && [ "$PORT" -ge 65535 ]; then
+    die "$(t '双协议需要主端口 ≤65534' 'Dual protocol needs main port ≤65534')"
+  fi
+  msg ""
+  t "将应用协议: $(protocol_label)" "Will apply protocol: $(protocol_label)"
 }
 
 ensure_config_noninteractive() {
@@ -1573,7 +1752,10 @@ do_install() {
     local cur
     cur="$(installed_version || true)"
     t "检测到已安装 mita ${cur:-未知版本}" "mita already installed (${cur:-unknown})"
-    if ! confirm '继续将重新配置并尝试升级？[y/N]: ' 'Continue to reconfigure/upgrade? [y/N]: ' n; then
+    t '如需改端口/密码/协议，请选菜单「重新配置」或执行: install-mita reconfigure' \
+      'To change port/password/protocol, use menu Reconfigure or: install-mita reconfigure'
+    if ! confirm '继续将重新下载安装包并覆盖配置？[y/N]: ' \
+      'Continue full reinstall (re-download package)? [y/N]: ' n; then
       exit 0
     fi
   fi
@@ -1608,6 +1790,37 @@ do_install() {
     enable_tcp_bbr
   fi
 
+  print_summary
+}
+
+do_reconfigure() {
+  require_root
+  require_linux
+  mita_installed || die "$(t 'mita 未安装，请先执行安装' 'mita is not installed; run install first')"
+
+  local old_bindings desc bin cfg
+  bin="$(mita_bin)"
+  desc="$("$bin" describe config 2>/dev/null || true)"
+  old_bindings="$(extract_bindings_from_describe "$desc")"
+
+  if [ "$YES" -eq 1 ]; then
+    load_config_from_mita
+    ensure_config_noninteractive
+  else
+    collect_reconfigure_interactive
+  fi
+
+  ensure_mita_daemon
+  wait_mita_socket 30 || true
+  close_firewall_for_bindings "$old_bindings"
+  cfg="$(write_server_config)"
+  apply_config "$cfg"
+  open_firewall
+  start_mita
+  verify_mita_running
+  save_install_state
+  msg ""
+  t '========== 重新配置完成 ==========' '========== Reconfigure complete =========='
   print_summary
 }
 
@@ -1744,67 +1957,33 @@ do_status() {
 do_client_config() {
   require_root
   mita_installed || die "$(t 'mita 未安装' 'mita is not installed')"
-  local desc bin bindings
-  bin="$(mita_bin)"
-  desc="$("$bin" describe config 2>/dev/null || true)"
-  [ -n "$desc" ] || die "$(t '无法读取服务端配置' 'Cannot read server config')"
-
-  USERNAME="$(printf '%s' "$desc" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  PASSWORD="$(printf '%s' "$desc" | sed -n 's/.*"password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  [ -n "$USERNAME" ] && [ -n "$PASSWORD" ] || die "$(t '配置中缺少用户信息' 'Missing user info in config')"
-
-  load_install_state
-  bindings="$(extract_bindings_from_describe "$desc")"
-  if [ -n "$bindings" ]; then
-    PORT=""
-    PORT_RANGE=""
-    local pp proto p has_tcp=0 has_udp=0 tcp_port=""
-    while IFS= read -r pp; do
-      [ -n "$pp" ] || continue
-      proto="${pp%%|*}"
-      p="${pp#*|}"
-      case "$proto" in
-        TCP)
-          has_tcp=1
-          if [[ "$p" =~ ^[0-9]+$ ]]; then
-            tcp_port="$p"
-          elif [[ "$p" == *-* ]]; then
-            PORT_RANGE="$p"
-          fi
-          ;;
-        UDP) has_udp=1 ;;
-      esac
-    done <<< "$bindings"
-    [ -n "$tcp_port" ] && PORT="$tcp_port"
-    if [ "$has_tcp" -gt 0 ] && [ "$has_udp" -gt 0 ]; then
-      PROTOCOL="BOTH"
-    elif [ "$has_udp" -gt 0 ]; then
-      PROTOCOL="UDP"
-    else
-      PROTOCOL="TCP"
-    fi
-  fi
+  load_config_from_mita
   generate_client_config
 }
 
 show_menu() {
   print_banner
-  msg "  1) 安装 / 配置"
-  msg "  2) 升级"
-  msg "  3) 卸载"
-  msg "  4) 状态"
-  msg "  5) 生成客户端配置"
-  msg "  6) 退出"
+  msg "  1) 新装安装"
+  msg "  2) 重新配置（端口 / 密码 / 协议）"
+  msg "  3) 升级"
+  msg "  4) 卸载"
+  msg "  5) 状态"
+  msg "  6) 查看节点链接 / 客户端配置"
+  msg "  7) 退出"
+  msg ""
+  t '快捷命令: install-mita / mita-menu / mita status（不区分大小写）' \
+    'Quick: install-mita / mita-menu / mita status (case-insensitive)'
   msg ""
   local choice=""
-  read_tty choice "$(t '请选择 [1-6]: ' 'Choose [1-6]: ')" || die "$(t '无法读取输入' 'Cannot read input')"
+  read_tty choice "$(t '请选择 [1-7]: ' 'Choose [1-7]: ')" || die "$(t '无法读取输入' 'Cannot read input')"
   case "$choice" in
     1) ACTION=install ;;
-    2) ACTION=upgrade ;;
-    3) ACTION=uninstall ;;
-    4) ACTION=status ;;
-    5) ACTION=client-config ;;
-    6) exit 0 ;;
+    2) ACTION=reconfigure ;;
+    3) ACTION=upgrade ;;
+    4) ACTION=uninstall ;;
+    5) ACTION=status ;;
+    6) ACTION=client-config ;;
+    7) exit 0 ;;
     *) die "$(t '无效选择' 'Invalid choice')" ;;
   esac
 }
@@ -1819,6 +1998,7 @@ main() {
   fi
   case "$ACTION" in
     install) do_install ;;
+    reconfigure) do_reconfigure ;;
     upgrade) do_upgrade ;;
     uninstall) do_uninstall ;;
     status) do_status ;;

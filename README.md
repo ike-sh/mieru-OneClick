@@ -32,6 +32,13 @@ apk add --no-cache bash curl && \
 5. 安装完成**同时输出** `mierus://` 节点链接、客户端 JSON、**Clash/mihomo 片段**及连接信息摘要
 6. 下载包 **SHA256 校验**；提示云安全组放行端口
 
+### v1.2.14 增强
+
+- 新增 **重新配置**（菜单 2 / `--reconfigure`）：部署后可改端口、密码、协议，无需重装
+- 菜单 **6) 查看节点链接 / 客户端配置**：随时重新展示 `mierus://` 链接、JSON、Clash 片段
+- **快捷命令不区分大小写**：`install-mita STATUS`、`mita-menu`、`mita reconfigure` 等均可用
+- 登录 shell 安装 `mita()` 函数：`mita` 打开菜单，管理子命令不区分大小写；`mita start` 等仍走官方二进制
+
 ### v1.2.13 修复
 
 - OpenRC `crashed` 状态自动 `zap` + 重启（修复 `rc-service mita start` 提示 already started 无法恢复）
@@ -140,10 +147,21 @@ curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-
 
 | 命令 | 说明 |
 |------|------|
+| `--reconfigure` | 修改端口/密码/协议（不重装二进制） |
 | `--upgrade` | 升级至最新版 |
 | `--uninstall` | 卸载 mita、管理脚本、防火墙规则、客户端配置与日志 |
 | `--status` | 查看服务与配置 |
-| `--client-config` | 根据当前服务端配置生成客户端 JSON |
+| `--client-config` / `--show` | 查看节点链接并生成客户端 JSON |
+
+快捷命令（子命令不区分大小写）：
+
+```sh
+install-mita                  # 打开菜单
+install-mita reconfigure      # 重新配置
+install-mita show             # 查看节点链接
+mita-menu status              # 同上
+mita status                   # 登录 shell 下（需已安装 profile.d）
+```
 
 卸载后再次管理请重新执行一键安装，或运行 `install-mita --help`（安装后位于 `/usr/local/bin/install-mita`）。
 
