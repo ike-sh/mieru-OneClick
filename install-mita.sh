@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.22"
+SCRIPT_VERSION="1.2.23"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -104,7 +104,8 @@ mieru mita 服务端一键安装 ${SCRIPT_VERSION}
   install-mita show               查看节点链接
   install-mita restart            重启服务（start/stop 同理）
   mita-menu                       同上（安装后可用）
-  登录 shell 下输入 mita          管理子命令不区分大小写；mita start 等仍走官方二进制
+  登录 shell 下输入 mita          管理子命令不区分大小写；mita start/stop/restart 已走干净启停（含 systemd/openrc）
+  其余如 mita run/apply/reload     仍透传官方二进制
 
 一键安装（交互式，Debian/Ubuntu/CentOS 等）：
   curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-mita.sh | sudo bash
@@ -516,7 +517,7 @@ fi
 if [ $# -gt 0 ] && [ -x "$INSTALL_MITA" ]; then
   cmd="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   case "$cmd" in
-    menu|install|upgrade|uninstall|status|reconfigure|client-config|show|配置|节点|help)
+    menu|install|upgrade|uninstall|status|reconfigure|client-config|show|start|stop|restart|配置|节点|help)
       shift
       exec "$INSTALL_MITA" "$cmd" "$@"
       ;;
@@ -643,7 +644,7 @@ if [ $# -eq 0 ]; then
 fi
 cmd="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
 case "$cmd" in
-  install|upgrade|uninstall|status|reconfigure|client-config|show|menu|配置|节点)
+  install|upgrade|uninstall|status|reconfigure|client-config|show|menu|start|stop|restart|配置|节点)
     set -- "$cmd" "${@:2}"
     ;;
 esac
@@ -672,7 +673,7 @@ mita() {
   local cmd
   cmd="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
   case "$cmd" in
-    menu|install|upgrade|uninstall|status|reconfigure|client-config|show|配置|节点|help)
+    menu|install|upgrade|uninstall|status|reconfigure|client-config|show|start|stop|restart|配置|节点|help)
       shift
       "$im" "$cmd" "$@"
       ;;
@@ -1737,6 +1738,7 @@ verify_mita_running() {
   warn "$(t "mita 未处于 RUNNING 状态，请执行: $(mita_restart_hint) && mita status && mita start" \
     "mita is not RUNNING; run: $(mita_restart_hint) && mita status && mita start")"
   [ -n "$status_out" ] && msg "$status_out"
+  return 0
 }
 
 add_op_user() {
@@ -2047,6 +2049,7 @@ do_install() {
       'To change port/password/protocol, use menu Reconfigure or: install-mita reconfigure'
     if ! confirm '继续将重新下载安装包并覆盖配置？[y/N]: ' \
       'Continue full reinstall (re-download package)? [y/N]: ' n; then
+      [ "${MENU_MODE:-0}" -eq 1 ] && return 0
       exit 0
     fi
   fi
@@ -2182,10 +2185,16 @@ do_uninstall() {
   if ! installed_by_oneclick; then
     warn "$(t '未检测到本脚本安装标记；若仅使用官方 deb/rpm，卸载范围可能不同' \
       'OneClick install marker not found; official package uninstall may differ')"
-    confirm '仍要继续卸载？[y/N]: ' 'Continue uninstall anyway? [y/N]: ' n || exit 0
+    if ! confirm '仍要继续卸载？[y/N]: ' 'Continue uninstall anyway? [y/N]: ' n; then
+      [ "${MENU_MODE:-0}" -eq 1 ] && return 0
+      exit 0
+    fi
   fi
-  confirm '确认卸载 mita、管理脚本及全部配置？[y/N]: ' \
-    'Uninstall mita, manager script, and all config? [y/N]: ' n || exit 0
+  if ! confirm '确认卸载 mita、管理脚本及全部配置？[y/N]: ' \
+    'Uninstall mita, manager script, and all config? [y/N]: ' n; then
+    [ "${MENU_MODE:-0}" -eq 1 ] && return 0
+    exit 0
+  fi
   local pm
   pm="$(detect_pkg_manager)"
   close_firewall
@@ -2204,6 +2213,7 @@ do_status() {
   sm="$(service_manager)"
   if ! mita_installed; then
     t 'mita 未安装' 'mita is not installed'
+    [ "${MENU_MODE:-0}" -eq 1 ] && return 1
     exit 1
   fi
   msg ""
@@ -2307,13 +2317,25 @@ do_restart() {
   t 'mita 服务已重启' 'mita service restarted'
 }
 
+menu_pause() {
+  local _ignore=""
+  msg ""
+  read_tty _ignore "$(t '按回车返回主菜单...' 'Press Enter to return to the menu...')" || true
+}
+
 menu_run_action() {
   local rc=0
   case "$ACTION" in
     install) do_install || rc=1 ;;
     reconfigure) do_reconfigure || rc=1 ;;
     upgrade) do_upgrade || rc=1 ;;
-    uninstall) do_uninstall; return 2 ;;
+    uninstall)
+      if do_uninstall; then
+        mita_installed || return 2
+      else
+        rc=1
+      fi
+      ;;
     status) do_status || rc=1 ;;
     client-config) do_client_config || rc=1 ;;
     start) do_start || rc=1 ;;
@@ -2351,6 +2373,7 @@ menu_loop() {
       fi
       warn "$(t '操作未完成，请重试或选 5) 状态 排查' 'Action failed; retry or use 5) Status')"
     fi
+    menu_pause
   done
 }
 
