@@ -32,6 +32,10 @@ apk add --no-cache bash curl && \
 5. 安装完成**同时输出** `mierus://` 节点链接、客户端 JSON、**Clash/mihomo 片段**及连接信息摘要
 6. 下载包 **SHA256 校验**；提示云安全组放行端口
 
+### v1.2.16 增强
+
+- 「查看节点链接」输出增加分区标题与说明：标注 `mierus://` 为分享链接、JSON 为客户端配置及导入方式
+
 ### v1.2.15 修复
 
 - **`mita` 快捷命令**：`/usr/local/bin/mita` 改为管理入口（无参数打开菜单）；真实二进制迁至 `mita-real`，OpenRC/systemd 直连真实二进制

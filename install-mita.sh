@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.15"
+SCRIPT_VERSION="1.2.16"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -1844,35 +1844,26 @@ print_summary() {
 }
 
 generate_client_config() {
-  local ip ts suffix proto link cfg_path multi=0 count
+  local ip
   ip="$(public_ip || echo 'YOUR_SERVER_IP')"
-  ts="$(date +%Y%m%d_%H%M%S)"
-  count="$(protocol_output_count)"
-  if [ "$count" -gt 1 ]; then
-    multi=1
+  msg ""
+  t '========== 节点链接与客户端配置 ==========' \
+    '========== Share links & client config =========='
+  print_protocol_outputs "$ip"
+  msg ""
+  t '【导入方式】' '[How to import]'
+  if [ "$PROTOCOL" = "BOTH" ]; then
+    msg '  mieru import config "<TCP 节点链接>"   # TCP / UDP 各用对应链接'
+    msg '  mieru apply config /root/mieru_client_tcp_*.json'
+    msg '  mieru apply config /root/mieru_client_udp_*.json'
+  else
+    msg '  mieru import config "<节点链接>"   # 一键导入（简单链接）'
+    msg '  mieru apply config /root/mieru_client_*.json   # 完整 JSON（含 socks5 端口）'
   fi
-  while IFS= read -r proto; do
-    [ -n "$proto" ] || continue
-    suffix="$(proto_lower "$proto")"
-    if [ "$multi" -eq 1 ]; then
-      cfg_path="/root/mieru_client_${suffix}_${ts}.json"
-    else
-      cfg_path="/root/mieru_client_${ts}.json"
-    fi
-    build_client_json_for "$ip" "$proto" >"$cfg_path"
-    t "客户端配置已保存: ${cfg_path}" "Client config saved: ${cfg_path}"
-    link="$(generate_share_link_for "$ip" "$proto")"
-    msg ""
-    if [ "$multi" -eq 1 ]; then
-      t "${proto} 节点链接:" "${proto} share link:"
-    else
-      t '节点链接:' 'Share link:'
-    fi
-    msg "$link"
-    msg ""
-    cat "$cfg_path"
-    msg ""
-  done < <(protocols_for_mode)
+  msg ""
+  t '说明: 上方 mierus:// 为分享链接；JSON 为 mieru **客户端**配置（在电脑/手机导入，勿在服务器 mita apply）' \
+    'Note: mierus:// is the share link; JSON is for mieru **client** on your device — do NOT mita apply on server'
+  msg ""
   t '【Clash / mihomo 配置片段】' '[Clash / mihomo snippet]'
   build_clash_yaml_full "$ip"
   cloud_firewall_hint
