@@ -32,6 +32,13 @@ apk add --no-cache bash curl && \
 5. 安装完成**同时输出** `mierus://` 节点链接、客户端 JSON、**Clash/mihomo 片段**及连接信息摘要
 6. 下载包 **SHA256 校验**；提示云安全组放行端口
 
+### v1.2.15 修复
+
+- **`mita` 快捷命令**：`/usr/local/bin/mita` 改为管理入口（无参数打开菜单）；真实二进制迁至 `mita-real`，OpenRC/systemd 直连真实二进制
+- 打开菜单时自动安装/更新 wrapper（升级提示「已是最新」时也会更新管理脚本）
+- 修复「查看节点链接」失败：`describe config` 密码哈希时从 `install-state.env` 或 `/root/mieru_client_*.json` 回退读取凭据
+- 安装状态文件保存用户名/密码（`chmod 600`）
+
 ### v1.2.14 增强
 
 - 新增 **重新配置**（菜单 2 / `--reconfigure`）：部署后可改端口、密码、协议，无需重装

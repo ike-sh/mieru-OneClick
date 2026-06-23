@@ -4,13 +4,14 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.14"
+SCRIPT_VERSION="1.2.15"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
 GITHUB_API="https://api.github.com/repos/${UPSTREAM_REPO}/releases/latest"
 GITHUB_DL="https://github.com/${UPSTREAM_REPO}/releases/download"
 MITA_BIN="/usr/local/bin/mita"
+MITA_REAL_BIN="/usr/local/bin/mita-real"
 MITA_MARKER="/etc/mita/.mieru-oneclick"
 MITA_STATE="/etc/mita/install-state.env"
 INSTALL_SCRIPT_PATH="/usr/local/bin/install-mita"
@@ -400,9 +401,12 @@ save_install_state() {
 PORT=${PORT}
 PORT_RANGE=${PORT_RANGE}
 PROTOCOL=${PROTOCOL}
+USERNAME=${USERNAME}
+PASSWORD=${PASSWORD}
 INSTALL_SCRIPT=${INSTALL_SCRIPT_PATH}
 INSTALL_METHOD=oneclick
 EOF
+  run chmod 0600 "$MITA_STATE" 2>/dev/null || true
   run touch "$MITA_MARKER"
 }
 
@@ -432,7 +436,59 @@ install_self_script() {
     run curl -fsSL "$SCRIPT_REPO_RAW" -o "$INSTALL_SCRIPT_PATH"
     run chmod 0755 "$INSTALL_SCRIPT_PATH"
   fi
+  migrate_mita_binary_layout
   install_mita_shortcuts
+}
+
+ensure_management_scripts() {
+  STAGE="更新管理脚本"
+  install_self_script
+}
+
+install_mita_wrapper() {
+  STAGE="安装 mita 快捷入口"
+  cat >"$MITA_BIN" <<'EOF'
+#!/usr/bin/env bash
+# mieru-OneClick mita wrapper — 无参数打开菜单；管理子命令不区分大小写
+MITA_REAL="/usr/local/bin/mita-real"
+[ -x "$MITA_REAL" ] || MITA_REAL="/usr/bin/mita"
+INSTALL_MITA="/usr/local/bin/install-mita"
+
+if [ $# -eq 0 ] && [ -x "$INSTALL_MITA" ]; then
+  exec "$INSTALL_MITA"
+fi
+
+if [ $# -gt 0 ] && [ -x "$INSTALL_MITA" ]; then
+  cmd="$(printf '%s' "$1" | tr '[:upper:]' '[:lower:]')"
+  case "$cmd" in
+    menu|install|upgrade|uninstall|status|reconfigure|client-config|show|配置|节点|help)
+      shift
+      exec "$INSTALL_MITA" "$cmd" "$@"
+      ;;
+  esac
+fi
+
+[ -x "$MITA_REAL" ] || { echo "[错误] 未找到 mita 二进制: $MITA_REAL" >&2; exit 127; }
+exec "$MITA_REAL" "$@"
+EOF
+  run chmod 0755 "$MITA_BIN"
+}
+
+migrate_mita_binary_layout() {
+  STAGE="迁移 mita 二进制布局"
+  if [ -f "$MITA_BIN" ] && [ ! -f "$MITA_REAL_BIN" ] && ! is_mita_wrapper "$MITA_BIN"; then
+    run mv "$MITA_BIN" "$MITA_REAL_BIN"
+    run rm -f /usr/bin/mita
+    run ln -sf "$MITA_REAL_BIN" /usr/bin/mita-real 2>/dev/null || true
+    if [ -f "$OPENRC_SVC" ]; then
+      install_mita_openrc
+    elif [ -f "$SYSTEMD_SVC" ]; then
+      install_mita_systemd
+    fi
+  fi
+  if mita_installed || [ -f "$MITA_MARKER" ]; then
+    install_mita_wrapper
+  fi
 }
 
 install_mita_shortcuts() {
@@ -586,18 +642,31 @@ mita_installed() {
   if command -v rpm >/dev/null 2>&1 && rpm -q mita >/dev/null 2>&1; then
     return 0
   fi
+  [ -x "$MITA_REAL_BIN" ] && [ -f "$MITA_MARKER" ] && return 0
   [ -x "$MITA_BIN" ] && [ -f "$MITA_MARKER" ] && return 0
   command -v mita >/dev/null 2>&1
 }
 
-mita_bin() {
-  if [ -x "$MITA_BIN" ]; then
+is_mita_wrapper() {
+  [ -f "$1" ] && head -n1 "$1" 2>/dev/null | grep -q 'mieru-OneClick mita wrapper'
+}
+
+mita_real_bin() {
+  if [ -x "$MITA_REAL_BIN" ]; then
+    printf '%s' "$MITA_REAL_BIN"
+  elif [ -x /usr/bin/mita ] && ! is_mita_wrapper /usr/bin/mita; then
+    printf '%s' /usr/bin/mita
+  elif [ -x "$MITA_BIN" ] && ! is_mita_wrapper "$MITA_BIN"; then
     printf '%s' "$MITA_BIN"
-  elif command -v mita >/dev/null 2>&1; then
-    command -v mita
+  elif command -v mita-real >/dev/null 2>&1; then
+    command -v mita-real
   else
-    printf '%s' "$MITA_BIN"
+    printf '%s' "$MITA_REAL_BIN"
   fi
+}
+
+mita_bin() {
+  mita_real_bin
 }
 
 installed_version() {
@@ -700,7 +769,7 @@ ensure_mita_account() {
 install_mita_systemd() {
   STAGE="安装 systemd 服务"
   local bin
-  bin="$(mita_bin)"
+  bin="$(mita_real_bin)"
   cat >"$SYSTEMD_SVC" <<EOF
 [Unit]
 Description=Mieru proxy server
@@ -724,7 +793,7 @@ EOF
 install_mita_openrc() {
   STAGE="安装 OpenRC 服务"
   local bin
-  bin="$(mita_bin)"
+  bin="$(mita_real_bin)"
   cat >"$OPENRC_SVC" <<EOF
 #!/sbin/openrc-run
 
@@ -774,8 +843,10 @@ extract_mita_tarball() {
   run tar -xzf "$tarball" -C "$tmpdir"
   bin="$(find "$tmpdir" -type f -name mita | head -n1)"
   [ -n "$bin" ] || die "$(t '压缩包中未找到 mita 二进制' 'mita binary not found in archive')"
-  run install -m 0755 "$bin" "$MITA_BIN"
-  run ln -sf "$MITA_BIN" /usr/bin/mita 2>/dev/null || true
+  run install -m 0755 "$bin" "$MITA_REAL_BIN"
+  run rm -f /usr/bin/mita /usr/bin/mita-real
+  run ln -sf "$MITA_REAL_BIN" /usr/bin/mita-real 2>/dev/null || true
+  install_mita_wrapper
   rm -rf "$tmpdir"
   run touch "$MITA_MARKER"
 }
@@ -902,11 +973,18 @@ load_config_from_mita() {
   desc="$("$bin" describe config 2>/dev/null || true)"
   [ -n "$desc" ] || die "$(t '无法读取服务端配置' 'Cannot read server config')"
 
-  USERNAME="$(printf '%s' "$desc" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  PASSWORD="$(printf '%s' "$desc" | sed -n 's/.*"password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
-  [ -n "$USERNAME" ] && [ -n "$PASSWORD" ] || die "$(t '配置中缺少用户信息' 'Missing user info in config')"
+  parse_user_from_describe "$desc" || true
+  if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
+    load_credentials_fallback
+  fi
+  if [ -z "$USERNAME" ]; then
+    die "$(t '配置中缺少用户名' 'Missing username in config')"
+  fi
+  if [ -z "$PASSWORD" ]; then
+    die "$(t '密码已哈希存储，无法生成节点链接。请选「重新配置」设置新密码，或查看 /root/mieru_client_*.json' \
+      'Password is hashed; cannot build share link. Use Reconfigure to set a new password, or check /root/mieru_client_*.json')"
+  fi
 
-  load_install_state
   bindings="$(extract_bindings_from_describe "$desc")"
   PORT=""
   PORT_RANGE=""
@@ -937,6 +1015,67 @@ load_config_from_mita() {
       PROTOCOL="TCP"
     fi
   fi
+  load_install_state
+}
+
+parse_user_from_describe() {
+  local desc="$1" line
+  [ -n "$desc" ] || return 1
+  if command -v python3 >/dev/null 2>&1; then
+    line="$(printf '%s' "$desc" | python3 -c '
+import json, sys
+try:
+    data = json.load(sys.stdin)
+except Exception:
+    sys.exit(1)
+users = data.get("users") or []
+if not users:
+    sys.exit(1)
+u = users[0]
+name = u.get("name", "") or ""
+pwd = u.get("password", "") or ""
+print(f"{name}\t{pwd}")
+' 2>/dev/null)" || return 1
+    USERNAME="${line%%$'\t'*}"
+    PASSWORD="${line#*$'\t'}"
+    [ -n "$USERNAME" ] && return 0
+    return 1
+  fi
+  USERNAME="$(printf '%s' "$desc" | sed -n 's/.*"name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  PASSWORD="$(printf '%s' "$desc" | sed -n 's/.*"password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)"
+  [ -n "$USERNAME" ] && [ -n "$PASSWORD" ]
+}
+
+load_credentials_fallback() {
+  load_install_state
+  [ -n "$USERNAME" ] && [ -n "$PASSWORD" ] && return 0
+  local f line
+  if ! command -v python3 >/dev/null 2>&1; then
+    return 1
+  fi
+  for f in /root/mieru_client_*.json /root/mieru_client_tcp_*.json /root/mieru_client_udp_*.json; do
+    [ -f "$f" ] || continue
+    line="$(python3 -c "
+import json, sys
+try:
+    d = json.load(open(sys.argv[1]))
+except Exception:
+    sys.exit(1)
+if 'profiles' in d:
+    p = d['profiles'][0]
+    u = p.get('user') or {}
+    print(f\"{u.get('name','')}\t{u.get('password','')}\")
+    sys.exit(0)
+users = d.get('users') or []
+if users:
+    u = users[0]
+    print(f\"{u.get('name','')}\t{u.get('password','')}\")
+" "$f" 2>/dev/null)" || continue
+    [ -z "$USERNAME" ] && USERNAME="${line%%$'\t'*}"
+    [ -z "$PASSWORD" ] && PASSWORD="${line#*$'\t'}"
+    [ -n "$USERNAME" ] && [ -n "$PASSWORD" ] && return 0
+  done
+  return 1
 }
 
 collect_reconfigure_interactive() {
@@ -1835,7 +1974,9 @@ do_upgrade() {
   local cur
   cur="$(installed_version || true)"
   if version_is_current "$cur" "$ver"; then
-    t "已是最新版本 ${cur}" "Already on latest version ${cur}"
+    install_self_script
+    t "管理脚本已更新至 v${SCRIPT_VERSION}（mita 二进制 ${cur} 已是最新）" \
+      "Manager script updated to v${SCRIPT_VERSION} (mita binary ${cur} is already latest)"
     exit 0
   fi
   url="$(package_url "$ver" "$pm" "$arch")"
@@ -1866,7 +2007,7 @@ remove_mita_common() {
   run rm -f /var/log/mita.log /var/log/mita.err
   run rm -f /root/mieru_client_*.json /root/mieru_client_tcp_*.json /root/mieru_client_udp_*.json 2>/dev/null || true
   run rm -rf /etc/mita /var/lib/mita /var/run/mita /var/run/mita.sock
-  run rm -f "$MITA_BIN" /usr/bin/mita "$MITA_MARKER" "$OPENRC_SVC"
+  run rm -f "$MITA_BIN" "$MITA_REAL_BIN" /usr/bin/mita /usr/bin/mita-real "$MITA_MARKER" "$OPENRC_SVC"
   run rm -f /lib/systemd/system/mita.service /usr/lib/systemd/system/mita.service "$SYSTEMD_SVC"
   run rm -f /etc/sysctl.d/mieru_tcp_bbr.conf
   run systemctl daemon-reload 2>/dev/null || true
@@ -1962,6 +2103,9 @@ do_client_config() {
 }
 
 show_menu() {
+  if mita_installed; then
+    ensure_management_scripts
+  fi
   print_banner
   msg "  1) 新装安装"
   msg "  2) 重新配置（端口 / 密码 / 协议）"
@@ -1971,8 +2115,8 @@ show_menu() {
   msg "  6) 查看节点链接 / 客户端配置"
   msg "  7) 退出"
   msg ""
-  t '快捷命令: install-mita / mita-menu / mita status（不区分大小写）' \
-    'Quick: install-mita / mita-menu / mita status (case-insensitive)'
+  t '快捷命令: 直接输入 mita 打开菜单（不区分大小写）' \
+    'Quick command: type mita to open menu (case-insensitive)'
   msg ""
   local choice=""
   read_tty choice "$(t '请选择 [1-7]: ' 'Choose [1-7]: ')" || die "$(t '无法读取输入' 'Cannot read input')"
