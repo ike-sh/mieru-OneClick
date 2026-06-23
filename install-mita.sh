@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.23"
+SCRIPT_VERSION="1.2.24"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -40,6 +40,9 @@ PASSWORD=""
 OP_USER=""
 MTU=1400
 MULTIPLEXING="MULTIPLEXING_LOW"
+TRAFFIC_PATTERN="conservative"
+TRAFFIC_SEED=""
+TRAFFIC_CLI=0
 CLIENT_RPC_PORT=8964
 CLIENT_SOCKS5_PORT=1080
 CLIENT_HTTP_PORT=8080
@@ -86,6 +89,7 @@ mieru mita 服务端一键安装 ${SCRIPT_VERSION}
   --port PORT         监听端口（1025-65535）
   --port-range RANGE  监听端口段，如 9000-9010
   --protocol TCP|UDP|BOTH  传输协议（默认 TCP；BOTH 时 UDP 使用 PORT+1）
+  --traffic-pattern LV  流量伪装/抗 DPI：off|conservative|aggressive（默认 conservative）
   --user NAME         代理用户名
   --password PASS     代理密码
   --op-user USER      加入 mita 用户组的 Linux 用户
@@ -189,6 +193,11 @@ while [ $# -gt 0 ]; do
     --protocol)
       PROTOCOL="${2:-}"
       PROTOCOL_CLI=1
+      shift
+      ;;
+    --traffic-pattern|--traffic)
+      TRAFFIC_PATTERN="${2:-}"
+      TRAFFIC_CLI=1
       shift
       ;;
     --user)
@@ -424,6 +433,8 @@ PORT_RANGE=${PORT_RANGE}
 PROTOCOL=${PROTOCOL}
 USERNAME=${USERNAME}
 PASSWORD=${PASSWORD}
+TRAFFIC_PATTERN=${TRAFFIC_PATTERN}
+TRAFFIC_SEED=${TRAFFIC_SEED}
 INSTALL_SCRIPT=${INSTALL_SCRIPT_PATH}
 INSTALL_METHOD=oneclick
 EOF
@@ -445,8 +456,11 @@ load_install_state() {
   PORT_RANGE=""
   PROTOCOL="TCP"
   [ -f "$MITA_STATE" ] || return 0
+  local _cli_tp="$TRAFFIC_PATTERN"
   # shellcheck disable=SC1090
   source "$MITA_STATE" 2>/dev/null || true
+  # 命令行显式指定 --traffic-pattern 时优先，不被已保存状态覆盖
+  [ "${TRAFFIC_CLI:-0}" -eq 1 ] && TRAFFIC_PATTERN="$_cli_tp"
 }
 
 install_self_script() {
@@ -1082,6 +1096,31 @@ choose_protocol_interactive() {
   esac
 }
 
+choose_traffic_pattern_interactive() {
+  [ "${TRAFFIC_CLI:-0}" -eq 1 ] && return 0
+  local cur def input=""
+  cur="$(normalize_traffic_pattern "${TRAFFIC_PATTERN:-conservative}")"
+  case "$cur" in off) def=1 ;; aggressive) def=3 ;; *) def=2 ;; esac
+  msg ""
+  t '流量伪装 / 抗 DPI（客户端无需与服务端一致）:' \
+    'Traffic obfuscation / anti-DPI (client need not match server):'
+  t '  1) 关闭 —— 仅 mita 内置隐式默认' \
+    '  1) Off — mita built-in implicit only'
+  t '  2) 保守 —— 可打印 Nonce + 末尾填充，几乎不影响速度（推荐）' \
+    '  2) Conservative — printable nonce + end padding, near-zero overhead (recommended)'
+  t '  3) 激进 —— 再加 TCP 分片 + 全量填充，更隐蔽但增加延迟/降速' \
+    '  3) Aggressive — also TCP fragment + full padding, stealthier but slower'
+  read_tty input "$(t "请选择 [1-3，默认 ${def}]: " "Choose [1-3, default ${def}]: ")" || input=""
+  input="${input:-$def}"
+  case "$input" in
+    1) TRAFFIC_PATTERN="off" ;;
+    3) TRAFFIC_PATTERN="aggressive" ;;
+    *) TRAFFIC_PATTERN="conservative" ;;
+  esac
+  msg ""
+  t "已选流量伪装: $(traffic_label)" "Traffic obfuscation: $(traffic_label)"
+}
+
 collect_config_interactive() {
   STAGE="交互配置"
   [ -n "$USERNAME" ] || USERNAME="$(random_token)"
@@ -1116,6 +1155,8 @@ collect_config_interactive() {
   fi
   msg ""
   t "已选协议: $(protocol_label)" "Selected protocol: $(protocol_label)"
+  choose_traffic_pattern_interactive
+  ensure_traffic_seed
 }
 
 load_config_from_mita() {
@@ -1290,6 +1331,8 @@ collect_reconfigure_interactive() {
   if [ "$PROTOCOL" = "BOTH" ] && [ -n "$PORT" ] && [ "$PORT" -ge 65535 ]; then
     die "$(t '双协议需要主端口 ≤65534' 'Dual protocol needs main port ≤65534')"
   fi
+  choose_traffic_pattern_interactive
+  ensure_traffic_seed
   msg ""
   t "将应用协议: $(protocol_label)" "Will apply protocol: $(protocol_label)"
 }
@@ -1317,10 +1360,100 @@ ensure_config_noninteractive() {
   if [ "$PROTOCOL" = "BOTH" ] && [ -n "$PORT" ] && [ "$PORT" -ge 65535 ]; then
     die "$(t '双协议需要主端口 ≤65534' 'Dual protocol needs main port ≤65534')"
   fi
+  TRAFFIC_PATTERN="$(normalize_traffic_pattern "$TRAFFIC_PATTERN")"
+  ensure_traffic_seed
+}
+
+normalize_traffic_pattern() {
+  case "$(printf '%s' "${1:-}" | tr '[:upper:]' '[:lower:]')" in
+    off|none|no|0|disable|disabled|close|关) printf 'off' ;;
+    aggressive|aggr|full|high|强|激进|2) printf 'aggressive' ;;
+    *) printf 'conservative' ;;
+  esac
+}
+
+traffic_label() {
+  case "$(normalize_traffic_pattern "${TRAFFIC_PATTERN:-conservative}")" in
+    off) t '关闭' 'Off' ;;
+    aggressive) t '激进' 'Aggressive' ;;
+    *) t '保守' 'Conservative' ;;
+  esac
+}
+
+random_seed() {
+  local s=""
+  if [ -r /dev/urandom ] && command -v od >/dev/null 2>&1; then
+    s="$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -dc '0-9')"
+  fi
+  [ -n "$s" ] || s=$(( (RANDOM << 15) | RANDOM ))
+  printf '%s' "$(( s % 2147483647 ))"
+}
+
+# 流量模式自 mita v3.28.0 起支持；旧二进制不识别该字段，需跳过以免 apply 失败
+mita_supports_traffic_pattern() {
+  local v
+  v="$(installed_version 2>/dev/null || true)"
+  [ -n "$v" ] || return 1
+  [ "$(printf '%s\n%s' "3.28.0" "$v" | sort -V 2>/dev/null | head -n1)" = "3.28.0" ]
+}
+
+ensure_traffic_seed() {
+  [ "$(normalize_traffic_pattern "${TRAFFIC_PATTERN:-conservative}")" = "off" ] && return 0
+  [ -n "$TRAFFIC_SEED" ] && return 0
+  TRAFFIC_SEED="$(random_seed)"
+}
+
+# 输出缩进后的 "trafficPattern": {...} 片段；off 或旧版 mita 时输出空
+traffic_pattern_json() {
+  local ind="${1:-  }"
+  local level seed
+  level="$(normalize_traffic_pattern "${TRAFFIC_PATTERN:-conservative}")"
+  [ "$level" = "off" ] && return 0
+  mita_supports_traffic_pattern || return 0
+  seed="${TRAFFIC_SEED:-0}"
+  if [ "$level" = "aggressive" ]; then
+    cat <<EOF
+${ind}"trafficPattern": {
+${ind}  "seed": ${seed},
+${ind}  "unlockAll": true,
+${ind}  "tcpFragment": { "enable": true, "maxSleepMs": 8 },
+${ind}  "nonce": { "type": "NONCE_TYPE_PRINTABLE", "applyToAllUDPPacket": true, "minLen": 6, "maxLen": 12 },
+${ind}  "padding": { "maxMiddlePaddingLen": 64, "maxEndPaddingLen": 255 }
+${ind}}
+EOF
+  else
+    cat <<EOF
+${ind}"trafficPattern": {
+${ind}  "seed": ${seed},
+${ind}  "unlockAll": false,
+${ind}  "nonce": { "type": "NONCE_TYPE_PRINTABLE", "applyToAllUDPPacket": true, "minLen": 4, "maxLen": 8 },
+${ind}  "padding": { "maxMiddlePaddingLen": 0, "maxEndPaddingLen": 128 }
+${ind}}
+EOF
+  fi
+}
+
+# 去掉 trafficPattern 字段后另存一份（mita 过旧时降级应用）；成功打印新路径
+strip_traffic_pattern() {
+  local src="$1" out
+  command -v python3 >/dev/null 2>&1 || return 1
+  out="$(mktemp_file .json)"
+  if python3 - "$src" "$out" <<'PY' 2>/dev/null
+import json, sys
+d = json.load(open(sys.argv[1]))
+d.pop("trafficPattern", None)
+json.dump(d, open(sys.argv[2], "w"), indent=2)
+PY
+  then
+    printf '%s' "$out"
+    return 0
+  fi
+  rm -f "$out" 2>/dev/null || true
+  return 1
 }
 
 write_server_config() {
-  local cfg bindings="" proto pp
+  local cfg bindings="" proto pp tp tp_section=""
   cfg="$(mktemp_file .json)"
   while IFS= read -r pp; do
     proto="${pp%%|*}"
@@ -1350,6 +1483,10 @@ ${binding}"
       bindings="${binding}"
     fi
   done < <(port_protocol_pairs)
+  ensure_traffic_seed
+  tp="$(traffic_pattern_json '  ')"
+  [ -n "$tp" ] && tp_section=",
+${tp}"
   cat >"$cfg" <<EOF
 {
   "portBindings": [
@@ -1362,7 +1499,7 @@ ${bindings}
     }
   ],
   "loggingLevel": "INFO",
-  "mtu": ${MTU}
+  "mtu": ${MTU}${tp_section}
 }
 EOF
   printf '%s' "$cfg"
@@ -1437,6 +1574,19 @@ apply_config() {
     wait_mita_socket 10 || true
     sleep 2
   done
+  # 兜底：若配置含 trafficPattern 且仍失败，可能是 mita 版本过旧不识别该字段，
+  # 自动去掉 trafficPattern 后降级应用其余配置，避免整装失败。
+  if grep -q '"trafficPattern"' "$cfg" 2>/dev/null; then
+    local stripped
+    stripped="$(strip_traffic_pattern "$cfg" || true)"
+    if [ -n "$stripped" ] && "$bin" apply config "$stripped" 2>/dev/null; then
+      warn "$(t '当前 mita 不支持流量伪装(trafficPattern)，已忽略该设置并应用其余配置；如需启用请升级 mita(选 3)。' \
+        'This mita build does not support trafficPattern; applied config without it. Upgrade mita (option 3) to enable.')"
+      rm -f "$cfg" "$stripped"
+      return 0
+    fi
+    rm -f "$stripped" 2>/dev/null || true
+  fi
   "$bin" apply config "$cfg" || die "$(t '应用配置失败' 'Failed to apply config')"
   rm -f "$cfg"
 }
@@ -1808,8 +1958,12 @@ generate_share_link_for() {
 build_client_json_for() {
   local ip="$1"
   local proto="$2"
-  local p binding
+  local p binding tp tp_section=""
   p="$(port_for_protocol "$proto")"
+  ensure_traffic_seed
+  tp="$(traffic_pattern_json '      ')"
+  [ -n "$tp" ] && tp_section=",
+${tp}"
   if [ -n "$PORT" ]; then
     binding=$(cat <<EOB
             {
@@ -1849,7 +2003,7 @@ ${binding}
       "multiplexing": {
         "level": "${MULTIPLEXING}"
       },
-      "handshakeMode": "HANDSHAKE_STANDARD"
+      "handshakeMode": "HANDSHAKE_STANDARD"${tp_section}
     }
   ],
   "activeProfile": "default",
@@ -1972,6 +2126,7 @@ print_summary() {
   t "  用户名: ${USERNAME}" "  Username: ${USERNAME}"
   t "  密码:   ${PASSWORD}" "  Password: ${PASSWORD}"
   t "  协议:   $(protocol_label)" "  Protocol: $(protocol_label)"
+  t "  流量伪装: $(traffic_label)" "  Obfuscation: $(traffic_label)"
   if [ -n "$PORT" ]; then
     if [ "$PROTOCOL" = "BOTH" ]; then
       t "  端口:   TCP ${PORT} / UDP $((PORT + 1))" "  Ports:    TCP ${PORT} / UDP $((PORT + 1))"
