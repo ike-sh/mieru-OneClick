@@ -32,6 +32,12 @@ apk add --no-cache bash curl && \
 5. 安装完成**同时输出** `mierus://` 节点链接、客户端 JSON、**Clash/mihomo 片段**及连接信息摘要
 6. 下载包 **SHA256 校验**；提示云安全组放行端口
 
+### v1.2.20 修复
+
+- 菜单模式下 `die` 不再 `exit`，操作失败自动返回菜单
+- Debian 自动修复 `/usr/bin/mita` 软链；二进制缺失时提示 `apt reinstall`
+- 查看节点前执行 `repair_mita_binary_paths` + 启动守护进程
+
 ### v1.2.19 修复
 
 - **菜单循环**：操作完成后返回菜单（不再直接退出）；无效/空输入提示重试

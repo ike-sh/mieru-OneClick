@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.19"
+SCRIPT_VERSION="1.2.20"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -119,7 +119,17 @@ EOF
 msg() { printf '%s\n' "$*"; }
 info() { msg "==> $*"; }
 warn() { msg "[警告] $*"; }
-die() { msg "[错误] $*" >&2; exit 1; }
+die() {
+  msg "[错误] $*" >&2
+  if [ "${MENU_MODE:-0}" -eq 1 ]; then
+    return 1
+  fi
+  exit 1
+}
+
+bail() {
+  die "$@" || return 1
+}
 
 t() {
   local zh="$1"
@@ -524,7 +534,14 @@ repair_mita_binary_paths() {
       if [ ! -e /usr/bin/mita ]; then
         run ln -sf "$deb_bin" /usr/bin/mita 2>/dev/null || true
       fi
+    else
+      warn "$(t 'mita deb 包已安装但找不到二进制，尝试重装: apt install --reinstall mita -y' \
+        'mita deb installed but binary missing; try: apt install --reinstall mita -y')"
     fi
+  fi
+  if ! [ -x "$(mita_real_bin 2>/dev/null || true)" ]; then
+    warn "$(t 'mita 二进制不可用，请执行: apt install --reinstall mita -y' \
+      'mita binary unavailable; run: apt install --reinstall mita -y')"
   fi
   install_mita_wrapper_force
   hash -r 2>/dev/null || true
@@ -1041,19 +1058,26 @@ collect_config_interactive() {
 load_config_from_mita() {
   local desc bin bindings
   bin="$(mita_bin)"
+  if ! [ -x "$bin" ]; then
+    bail "$(t '未找到 mita 二进制。Debian 请执行: apt install --reinstall mita -y' \
+      'mita binary not found. On Debian run: apt install --reinstall mita -y')" || return 1
+  fi
   desc="$("$bin" describe config 2>/dev/null || true)"
-  [ -n "$desc" ] || die "$(t '无法读取服务端配置' 'Cannot read server config')"
+  if [ -z "$desc" ]; then
+    bail "$(t '无法读取服务端配置。请先选 5) 状态 检查；若守护进程未运行: systemctl restart mita' \
+      'Cannot read server config. Use 5) Status; if daemon is down: systemctl restart mita')" || return 1
+  fi
 
   parse_user_from_describe "$desc" || true
   if [ -z "$USERNAME" ] || [ -z "$PASSWORD" ]; then
     load_credentials_fallback
   fi
   if [ -z "$USERNAME" ]; then
-    die "$(t '配置中缺少用户名' 'Missing username in config')"
+    bail "$(t '配置中缺少用户名' 'Missing username in config')" || return 1
   fi
   if [ -z "$PASSWORD" ]; then
-    die "$(t '密码已哈希存储，无法生成节点链接。请选「重新配置」设置新密码，或查看 /root/mieru_client_*.json' \
-      'Password is hashed; cannot build share link. Use Reconfigure to set a new password, or check /root/mieru_client_*.json')"
+    bail "$(t '密码已哈希存储，无法生成节点链接。请选 2) 重新配置 设置新密码' \
+      'Password is hashed; use 2) Reconfigure to set a new password')" || return 1
   fi
 
   bindings="$(extract_bindings_from_describe "$desc")"
@@ -2163,10 +2187,11 @@ do_status() {
 
 do_client_config() {
   require_root
-  mita_installed || die "$(t 'mita 未安装' 'mita is not installed')"
+  mita_installed || bail "$(t 'mita 未安装' 'mita is not installed')" || return 1
+  repair_mita_binary_paths 2>/dev/null || true
   ensure_mita_daemon
   wait_mita_socket 20 || warn "$(t 'mita 守护进程未就绪，正在尝试继续...' 'mita daemon not ready, trying anyway...')"
-  load_config_from_mita
+  load_config_from_mita || return 1
   generate_client_config
 }
 
@@ -2186,6 +2211,8 @@ menu_run_action() {
 
 menu_loop() {
   MENU_MODE=1
+  trap - ERR
+  repair_mita_binary_paths 2>/dev/null || true
   if mita_installed; then
     ensure_management_scripts
     MENU_SCRIPTS_READY=1
