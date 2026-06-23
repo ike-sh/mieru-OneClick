@@ -32,6 +32,13 @@ apk add --no-cache bash curl && \
 5. 安装完成**同时输出** `mierus://` 节点链接、客户端 JSON、**Clash/mihomo 片段**及连接信息摘要
 6. 下载包 **SHA256 校验**；提示云安全组放行端口
 
+### v1.2.19 修复
+
+- **菜单循环**：操作完成后返回菜单（不再直接退出）；无效/空输入提示重试
+- **Debian 修复**：不再误删 `/usr/bin/mita`；自动 `apt` 包路径修复 + wrapper 动态查找二进制
+- 查看节点前自动启动守护进程；失败时提示而非退出菜单
+- 安装 wrapper 后执行 `hash -r` 刷新 bash 命令缓存
+
 ### v1.2.18 修复
 
 - 修复 Debian 选 6 卡死/CPU 拉满：`is_mita_wrapper` 误对 ELF 二进制 `head -n1` 导致 grep 扫描整个文件

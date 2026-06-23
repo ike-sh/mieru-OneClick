@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.18"
+SCRIPT_VERSION="1.2.19"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -22,6 +22,8 @@ OPENRC_SVC="/etc/init.d/mita"
 SYSTEMD_SVC="/etc/systemd/system/mita.service"
 
 ACTION=""
+MENU_MODE=0
+MENU_SCRIPTS_READY=0
 YES=0
 DRY_RUN=0
 LANG_ZH=1
@@ -461,6 +463,7 @@ install_mita_wrapper_force() {
 ensure_management_scripts() {
   STAGE="更新管理脚本"
   install_self_script
+  repair_mita_binary_paths
 }
 
 install_mita_wrapper() {
@@ -468,9 +471,20 @@ install_mita_wrapper() {
   cat >"$MITA_BIN" <<'EOF'
 #!/usr/bin/env bash
 # mieru-OneClick mita wrapper — 无参数打开菜单；管理子命令不区分大小写
-MITA_REAL="/usr/local/bin/mita-real"
-[ -x "$MITA_REAL" ] || MITA_REAL="/usr/bin/mita"
 INSTALL_MITA="/usr/local/bin/install-mita"
+
+find_mita_real() {
+  local c
+  for c in /usr/local/bin/mita-real /usr/bin/mita; do
+    [ -x "$c" ] || continue
+    [ "$(head -c 4 "$c" 2>/dev/null || true)" = $'\x7fELF' ] || continue
+    printf '%s' "$c"
+    return 0
+  done
+  return 1
+}
+
+MITA_REAL="$(find_mita_real || true)"
 
 if [ $# -eq 0 ]; then
   if [ -x "$INSTALL_MITA" ]; then
@@ -491,10 +505,29 @@ if [ $# -gt 0 ] && [ -x "$INSTALL_MITA" ]; then
   esac
 fi
 
-[ -x "$MITA_REAL" ] || { echo "[错误] 未找到 mita 二进制: $MITA_REAL" >&2; exit 127; }
+if [ -z "$MITA_REAL" ]; then
+  echo "[错误] 未找到 mita 二进制；Debian 可执行: apt install --reinstall mita" >&2
+  exit 127
+fi
 exec "$MITA_REAL" "$@"
 EOF
   run chmod 0755 "$MITA_BIN"
+  hash -r 2>/dev/null || true
+}
+
+repair_mita_binary_paths() {
+  STAGE="修复 mita 二进制路径"
+  local deb_bin=""
+  if command -v dpkg >/dev/null 2>&1 && dpkg -l mita 2>/dev/null | grep -q '^ii'; then
+    deb_bin="$(dpkg -L mita 2>/dev/null | grep '/bin/mita$' | head -n1)"
+    if [ -n "$deb_bin" ] && [ -x "$deb_bin" ]; then
+      if [ ! -e /usr/bin/mita ]; then
+        run ln -sf "$deb_bin" /usr/bin/mita 2>/dev/null || true
+      fi
+    fi
+  fi
+  install_mita_wrapper_force
+  hash -r 2>/dev/null || true
 }
 
 migrate_mita_binary_layout() {
@@ -504,7 +537,9 @@ migrate_mita_binary_layout() {
   fi
   if [ -f "$MITA_BIN" ] && [ ! -f "$MITA_REAL_BIN" ] && is_mita_elf_binary "$MITA_BIN"; then
     run mv "$MITA_BIN" "$MITA_REAL_BIN"
-    run rm -f /usr/bin/mita
+    if [ -L /usr/bin/mita ] && [ "$(readlink -f /usr/bin/mita 2>/dev/null || true)" = "$(readlink -f "$MITA_REAL_BIN" 2>/dev/null || true)" ]; then
+      run rm -f /usr/bin/mita
+    fi
     run ln -sf "$MITA_REAL_BIN" /usr/bin/mita-real 2>/dev/null || true
     if [ -f "$OPENRC_SVC" ]; then
       install_mita_openrc
@@ -540,10 +575,16 @@ EOF
   cat >"$MITA_PROFILE_D" <<'EOF'
 # mieru-OneClick：登录 shell 下 mita 管理子命令不区分大小写
 mita() {
-  local mita_real="/usr/local/bin/mita"
   local im="/usr/local/bin/install-mita"
+  local real="" c
+  for c in /usr/local/bin/mita-real /usr/bin/mita; do
+    if [ -x "$c" ] && [ "$(head -c 4 "$c" 2>/dev/null || true)" = $'\x7fELF' ]; then
+      real="$c"
+      break
+    fi
+  done
   if [ ! -x "$im" ]; then
-    command "$mita_real" "$@"
+    [ -n "$real" ] && command "$real" "$@"
     return $?
   fi
   if [ $# -eq 0 ]; then
@@ -558,7 +599,7 @@ mita() {
       "$im" "$cmd" "$@"
       ;;
     *)
-      command "$mita_real" "$@"
+      [ -n "$real" ] && command "$real" "$@"
       ;;
   esac
 }
@@ -1998,6 +2039,7 @@ do_upgrade() {
     install_self_script
     t "管理脚本已更新至 v${SCRIPT_VERSION}（mita 二进制 ${cur} 已是最新）" \
       "Manager script updated to v${SCRIPT_VERSION} (mita binary ${cur} is already latest)"
+    [ "${MENU_MODE:-0}" -eq 1 ] && return 0
     exit 0
   fi
   url="$(package_url "$ver" "$pm" "$arch")"
@@ -2028,7 +2070,10 @@ remove_mita_common() {
   run rm -f /var/log/mita.log /var/log/mita.err
   run rm -f /root/mieru_client_*.json /root/mieru_client_tcp_*.json /root/mieru_client_udp_*.json 2>/dev/null || true
   run rm -rf /etc/mita /var/lib/mita /var/run/mita /var/run/mita.sock
-  run rm -f "$MITA_BIN" "$MITA_REAL_BIN" /usr/bin/mita /usr/bin/mita-real "$MITA_MARKER" "$OPENRC_SVC"
+  run rm -f "$MITA_BIN" "$MITA_REAL_BIN" /usr/bin/mita-real "$MITA_MARKER" "$OPENRC_SVC"
+  if ! command -v dpkg >/dev/null 2>&1 || ! dpkg -l mita 2>/dev/null | grep -q '^ii'; then
+    run rm -f /usr/bin/mita
+  fi
   run rm -f /lib/systemd/system/mita.service /usr/lib/systemd/system/mita.service "$SYSTEMD_SVC"
   run rm -f /etc/sysctl.d/mieru_tcp_bbr.conf
   run systemctl daemon-reload 2>/dev/null || true
@@ -2119,13 +2164,58 @@ do_status() {
 do_client_config() {
   require_root
   mita_installed || die "$(t 'mita 未安装' 'mita is not installed')"
+  ensure_mita_daemon
+  wait_mita_socket 20 || warn "$(t 'mita 守护进程未就绪，正在尝试继续...' 'mita daemon not ready, trying anyway...')"
   load_config_from_mita
   generate_client_config
 }
 
-show_menu() {
+menu_run_action() {
+  local rc=0
+  case "$ACTION" in
+    install) do_install || rc=1 ;;
+    reconfigure) do_reconfigure || rc=1 ;;
+    upgrade) do_upgrade || rc=1 ;;
+    uninstall) do_uninstall; return 2 ;;
+    status) do_status || rc=1 ;;
+    client-config) do_client_config || rc=1 ;;
+    *) warn "$(t '未知操作' 'Unknown action')"; return 1 ;;
+  esac
+  return "$rc"
+}
+
+menu_loop() {
+  MENU_MODE=1
   if mita_installed; then
     ensure_management_scripts
+    MENU_SCRIPTS_READY=1
+  fi
+  while true; do
+    ACTION=""
+    show_menu
+    local sm_rc=$?
+    if [ "$sm_rc" -eq 2 ]; then
+      break
+    fi
+    if [ "$sm_rc" -ne 0 ]; then
+      continue
+    fi
+    if menu_run_action; then
+      :
+    else
+      local rc=$?
+      if [ "$rc" -eq 2 ]; then
+        break
+      fi
+      warn "$(t '操作未完成，请重试或选 5) 状态 排查' 'Action failed; retry or use 5) Status')"
+    fi
+  done
+}
+
+show_menu() {
+  if [ "${MENU_SCRIPTS_READY:-0}" -eq 0 ] && mita_installed; then
+    ensure_management_scripts
+    MENU_SCRIPTS_READY=1
   fi
   print_banner
   msg "  1) 新装安装"
@@ -2140,7 +2230,12 @@ show_menu() {
     'Quick command: type mita to open menu (case-insensitive)'
   msg ""
   local choice=""
-  read_tty choice "$(t '请选择 [1-7]: ' 'Choose [1-7]: ')" || die "$(t '无法读取输入' 'Cannot read input')"
+  read_tty choice "$(t '请选择 [1-7]: ' 'Choose [1-7]: ')" || choice=""
+  choice="$(printf '%s' "$choice" | tr -d '[:space:]')"
+  if [ -z "$choice" ]; then
+    warn "$(t '请输入 1-7' 'Enter 1-7')"
+    return 1
+  fi
   case "$choice" in
     1) ACTION=install ;;
     2) ACTION=reconfigure ;;
@@ -2148,20 +2243,24 @@ show_menu() {
     4) ACTION=uninstall ;;
     5) ACTION=status ;;
     6) ACTION=client-config ;;
-    7) exit 0 ;;
-    *) die "$(t '无效选择' 'Invalid choice')" ;;
+    7) return 2 ;;
+    *)
+      warn "$(t '无效选择，请输入 1-7' 'Invalid choice, enter 1-7')"
+      return 1
+      ;;
   esac
+  return 0
 }
 
 main() {
-  if [ "$(id -u 2>/dev/null || echo 1)" -eq 0 ] && mita_installed && [ -z "${ACTION:-}" ]; then
-    migrate_mita_binary_layout 2>/dev/null || true
-  fi
-  local from_menu=0
   if [ -z "$ACTION" ]; then
-    show_menu
-    from_menu=1
-  elif [ "$ACTION" != "menu" ]; then
+    menu_loop
+    exit 0
+  fi
+  if [ "$(id -u 2>/dev/null || echo 1)" -eq 0 ] && mita_installed; then
+    repair_mita_binary_paths 2>/dev/null || true
+  fi
+  if [ "$ACTION" != "menu" ]; then
     print_banner
   fi
   case "$ACTION" in
@@ -2170,7 +2269,10 @@ main() {
     upgrade) do_upgrade ;;
     uninstall) do_uninstall ;;
     status) do_status ;;
-    client-config) do_client_config ;;
+    client-config|show) do_client_config ;;
+    menu)
+      menu_loop
+      ;;
     *) usage; exit 1 ;;
   esac
 }
