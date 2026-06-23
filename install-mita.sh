@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.24"
+SCRIPT_VERSION="1.2.25"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -424,20 +424,25 @@ port_protocol_pairs() {
   done < <(protocols_for_mode)
 }
 
+_state_kv() {
+  # 安全输出可被 source 还原的 KEY=VALUE：printf %q 处理空格/引号/$/# 等特殊字符
+  printf '%s=%s\n' "$1" "$(printf '%q' "${2-}")"
+}
+
 save_install_state() {
   STAGE="保存安装状态"
   run mkdir -p /etc/mita
-  cat >"$MITA_STATE" <<EOF
-PORT=${PORT}
-PORT_RANGE=${PORT_RANGE}
-PROTOCOL=${PROTOCOL}
-USERNAME=${USERNAME}
-PASSWORD=${PASSWORD}
-TRAFFIC_PATTERN=${TRAFFIC_PATTERN}
-TRAFFIC_SEED=${TRAFFIC_SEED}
-INSTALL_SCRIPT=${INSTALL_SCRIPT_PATH}
-INSTALL_METHOD=oneclick
-EOF
+  {
+    _state_kv PORT "$PORT"
+    _state_kv PORT_RANGE "$PORT_RANGE"
+    _state_kv PROTOCOL "$PROTOCOL"
+    _state_kv USERNAME "$USERNAME"
+    _state_kv PASSWORD "$PASSWORD"
+    _state_kv TRAFFIC_PATTERN "$TRAFFIC_PATTERN"
+    _state_kv TRAFFIC_SEED "$TRAFFIC_SEED"
+    _state_kv INSTALL_SCRIPT "$INSTALL_SCRIPT_PATH"
+    printf 'INSTALL_METHOD=oneclick\n'
+  } >"$MITA_STATE"
   run chmod 0600 "$MITA_STATE" 2>/dev/null || true
   run touch "$MITA_MARKER"
 }
@@ -1219,6 +1224,13 @@ load_config_from_mita() {
     fi
   fi
   load_install_state
+  # 旧安装：状态无 TRAFFIC_PATTERN 记录、且服务端配置本身无 trafficPattern 时，
+  # 不在客户端配置/重配里凭空注入（保持与服务端一致）；显式 --traffic-pattern 优先
+  if [ "${TRAFFIC_CLI:-0}" -ne 1 ] \
+     && ! grep -q '^TRAFFIC_PATTERN=' "$MITA_STATE" 2>/dev/null \
+     && ! printf '%s' "$desc" | grep -q '"trafficPattern"'; then
+    TRAFFIC_PATTERN="off"
+  fi
 }
 
 parse_user_from_describe() {
@@ -1401,6 +1413,14 @@ ensure_traffic_seed() {
   [ "$(normalize_traffic_pattern "${TRAFFIC_PATTERN:-conservative}")" = "off" ] && return 0
   [ -n "$TRAFFIC_SEED" ] && return 0
   TRAFFIC_SEED="$(random_seed)"
+}
+
+# 选了流量伪装但当前 mita 过旧不支持时给出明确提示（须在二进制就绪后调用）
+warn_traffic_unsupported() {
+  [ "$(normalize_traffic_pattern "${TRAFFIC_PATTERN:-conservative}")" = "off" ] && return 0
+  mita_supports_traffic_pattern && return 0
+  warn "$(t '当前 mita 版本不支持流量伪装（需 ≥3.28.0），本次不会写入 trafficPattern；如需启用请先选 3) 升级' \
+    'Current mita does not support traffic obfuscation (needs >=3.28.0); trafficPattern will be skipped. Use 3) Upgrade to enable.')"
 }
 
 # 输出缩进后的 "trafficPattern": {...} 片段；off 或旧版 mita 时输出空
@@ -2225,6 +2245,7 @@ do_install() {
   wait_mita_socket 30 || true
 
   add_op_user "$OP_USER"
+  warn_traffic_unsupported
   cfg="$(write_server_config)"
   apply_config "$cfg"
   open_firewall
@@ -2262,6 +2283,7 @@ do_reconfigure() {
   ensure_mita_daemon
   wait_mita_socket 30 || true
   close_firewall_for_bindings "$old_bindings"
+  warn_traffic_unsupported
   cfg="$(write_server_config)"
   apply_config "$cfg"
   open_firewall
@@ -2506,13 +2528,14 @@ menu_loop() {
   trap - ERR
   repair_mita_binary_paths 2>/dev/null || true
   if mita_installed; then
-    ensure_management_scripts
+    ensure_management_scripts || true
     MENU_SCRIPTS_READY=1
   fi
   while true; do
     ACTION=""
-    show_menu
-    local sm_rc=$?
+    # 安全捕获：set -e 下裸调用 show_menu 返回非0(无效输入)会直接退脚本
+    local sm_rc=0
+    show_menu || sm_rc=$?
     if [ "$sm_rc" -eq 2 ]; then
       break
     fi
@@ -2534,7 +2557,7 @@ menu_loop() {
 
 show_menu() {
   if [ "${MENU_SCRIPTS_READY:-0}" -eq 0 ] && mita_installed; then
-    ensure_management_scripts
+    ensure_management_scripts || true
     MENU_SCRIPTS_READY=1
   fi
   print_banner
