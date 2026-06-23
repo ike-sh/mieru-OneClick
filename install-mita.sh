@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.20"
+SCRIPT_VERSION="1.2.21"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -24,6 +24,7 @@ SYSTEMD_SVC="/etc/systemd/system/mita.service"
 ACTION=""
 MENU_MODE=0
 MENU_SCRIPTS_READY=0
+MITA_REINSTALL_TRIED=0
 YES=0
 DRY_RUN=0
 LANG_ZH=1
@@ -516,7 +517,8 @@ if [ $# -gt 0 ] && [ -x "$INSTALL_MITA" ]; then
 fi
 
 if [ -z "$MITA_REAL" ]; then
-  echo "[错误] 未找到 mita 二进制；Debian 可执行: apt install --reinstall mita" >&2
+  echo "[错误] 未找到 mita 二进制；请重新运行安装脚本并选 3) 升级 自动重装：" >&2
+  echo "  curl -fsSL https://raw.githubusercontent.com/ike-sh/mieru-OneClick/main/install-mita.sh | sudo bash -s -- upgrade -y" >&2
   exit 127
 fi
 exec "$MITA_REAL" "$@"
@@ -525,23 +527,75 @@ EOF
   hash -r 2>/dev/null || true
 }
 
+# 重新下载官方包并安装，修复缺失的 mita 二进制（deb/rpm）。
+# 注意：oneclick 的 deb 来自 GitHub Release，并不在 apt 源里，
+# 所以 `apt install --reinstall mita` 必定失败；这里改为脚本自行重下重装。
+reinstall_mita_package() {
+  [ "${MITA_REINSTALL_TRIED:-0}" -eq 1 ] && return 1
+  MITA_REINSTALL_TRIED=1
+  command -v curl >/dev/null 2>&1 || return 1
+  local pm arch ver url tmp
+  pm="$(detect_pkg_manager 2>/dev/null || true)"
+  case "$pm" in
+    deb|rpm) ;;
+    *) return 1 ;;
+  esac
+  arch="$(detect_arch 2>/dev/null || true)"
+  [ -n "$arch" ] || return 1
+  ver="$(installed_version 2>/dev/null || true)"
+  [ -n "$ver" ] || ver="$(query_latest_version 2>/dev/null || true)"
+  [ -n "$ver" ] || return 1
+  warn "$(t "mita 二进制缺失，正在自动重新下载并安装 v${ver}（apt 源中没有该包）..." \
+    "mita binary missing; auto re-downloading and installing v${ver} (not in apt repo)...")"
+  url="$(package_url "$ver" "$pm" "$arch" 2>/dev/null || true)"
+  [ -n "$url" ] || return 1
+  tmp="$(mktemp_file)"
+  # 子 shell 包裹：download/install 内部的 die→exit 只会终止子 shell，不会杀掉主流程
+  if ( download_package "$url" "$tmp" && install_package "$tmp" "$pm" ); then
+    rm -f "$tmp"
+    hash -r 2>/dev/null || true
+    return 0
+  fi
+  rm -f "$tmp"
+  return 1
+}
+
+# Debian/Ubuntu 专用自愈：SSH 断开会让 dpkg 停在半装状态，
+# 先 dpkg --configure -a 收尾，再恢复软链或重下重装。
+recover_deb_mita() {
+  command -v dpkg >/dev/null 2>&1 || return 1
+  # dpkg --configure -a 幂等：无中断时为空操作，有中断时完成收尾
+  run dpkg --configure -a 2>/dev/null || true
+  local deb_bin
+  deb_bin="$(dpkg -L mita 2>/dev/null | grep '/bin/mita$' | head -n1)"
+  if [ -n "$deb_bin" ] && [ -x "$deb_bin" ] && [ ! -e /usr/bin/mita ]; then
+    run ln -sf "$deb_bin" /usr/bin/mita 2>/dev/null || true
+  fi
+  is_mita_elf_binary /usr/bin/mita && return 0
+  reinstall_mita_package
+}
+
 repair_mita_binary_paths() {
   STAGE="修复 mita 二进制路径"
-  local deb_bin=""
-  if command -v dpkg >/dev/null 2>&1 && dpkg -l mita 2>/dev/null | grep -q '^ii'; then
+  local is_deb=0
+  if command -v dpkg >/dev/null 2>&1; then
+    is_deb=1
+  fi
+  if [ "$is_deb" -eq 1 ]; then
+    local deb_bin
     deb_bin="$(dpkg -L mita 2>/dev/null | grep '/bin/mita$' | head -n1)"
-    if [ -n "$deb_bin" ] && [ -x "$deb_bin" ]; then
-      if [ ! -e /usr/bin/mita ]; then
-        run ln -sf "$deb_bin" /usr/bin/mita 2>/dev/null || true
-      fi
-    else
-      warn "$(t 'mita deb 包已安装但找不到二进制，尝试重装: apt install --reinstall mita -y' \
-        'mita deb installed but binary missing; try: apt install --reinstall mita -y')"
+    if [ -n "$deb_bin" ] && [ -x "$deb_bin" ] && [ ! -e /usr/bin/mita ]; then
+      run ln -sf "$deb_bin" /usr/bin/mita 2>/dev/null || true
     fi
   fi
-  if ! [ -x "$(mita_real_bin 2>/dev/null || true)" ]; then
-    warn "$(t 'mita 二进制不可用，请执行: apt install --reinstall mita -y' \
-      'mita binary unavailable; run: apt install --reinstall mita -y')"
+  if ! is_mita_elf_binary "$(mita_real_bin 2>/dev/null || true)"; then
+    if [ "$is_deb" -eq 1 ]; then
+      recover_deb_mita || warn "$(t 'mita 二进制自动修复未成功，请重新运行脚本并选 3) 升级 重新安装' \
+        'auto-repair failed; re-run the script and choose 3) Upgrade to reinstall')"
+    else
+      warn "$(t 'mita 二进制不可用，请重新运行脚本并选 3) 升级 重新安装' \
+        'mita binary unavailable; re-run the script and choose 3) Upgrade to reinstall')"
+    fi
   fi
   install_mita_wrapper_force
   hash -r 2>/dev/null || true
@@ -718,7 +772,8 @@ query_latest_version() {
 }
 
 mita_installed() {
-  if command -v dpkg >/dev/null 2>&1 && dpkg -l mita 2>/dev/null | grep -q '^ii'; then
+  # ^i[iUFH]: 已安装(ii) 或被中断的半装状态(iU/iF/iH)，后者也需进入修复流程
+  if command -v dpkg >/dev/null 2>&1 && dpkg -l mita 2>/dev/null | grep -qE '^i[iUFH]'; then
     return 0
   fi
   if command -v rpm >/dev/null 2>&1 && rpm -q mita >/dev/null 2>&1; then
@@ -1059,8 +1114,12 @@ load_config_from_mita() {
   local desc bin bindings
   bin="$(mita_bin)"
   if ! [ -x "$bin" ]; then
-    bail "$(t '未找到 mita 二进制。Debian 请执行: apt install --reinstall mita -y' \
-      'mita binary not found. On Debian run: apt install --reinstall mita -y')" || return 1
+    recover_deb_mita 2>/dev/null || true
+    bin="$(mita_bin)"
+  fi
+  if ! [ -x "$bin" ]; then
+    bail "$(t '未找到 mita 二进制，自动修复未成功；请重新运行脚本并选 3) 升级 重新安装' \
+      'mita binary not found and auto-repair failed; re-run the script and choose 3) Upgrade')" || return 1
   fi
   desc="$("$bin" describe config 2>/dev/null || true)"
   if [ -z "$desc" ]; then
