@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.12"
+SCRIPT_VERSION="1.2.13"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -429,6 +429,42 @@ service_manager() {
   fi
 }
 
+mita_restart_hint() {
+  case "$(service_manager)" in
+    systemd) printf '%s' 'systemctl restart mita' ;;
+    openrc) printf '%s' 'rc-service mita zap && rc-service mita start' ;;
+    *) printf '%s' "$(mita_bin) run &" ;;
+  esac
+}
+
+mita_log_hint() {
+  case "$(service_manager)" in
+    systemd) printf '%s' 'journalctl -e -u mita --no-pager' ;;
+    openrc) printf '%s' 'tail -n 30 /var/log/mita.err /var/log/mita.log' ;;
+    *) printf '%s' 'tail -n 30 /var/log/mita.err /var/log/mita.log' ;;
+  esac
+}
+
+openrc_mita_status_line() {
+  rc-service mita status 2>/dev/null || true
+}
+
+openrc_mita_is_crashed() {
+  openrc_mita_status_line | grep -qi crashed
+}
+
+openrc_mita_is_started() {
+  openrc_mita_status_line | grep -qE 'started|running'
+}
+
+openrc_mita_recover() {
+  if openrc_mita_is_crashed || ! openrc_mita_is_started; then
+    run rc-service mita zap 2>/dev/null || true
+  fi
+  run rc-service mita start 2>/dev/null || run rc-service mita restart 2>/dev/null || true
+  sleep 2
+}
+
 arch_tar_suffix() {
   local arch="$1"
   case "$arch" in
@@ -620,6 +656,9 @@ pidfile="/run/\${RC_SVCNAME}.pid"
 output_log="/var/log/mita.log"
 error_log="/var/log/mita.err"
 directory="/var/lib/mita"
+respawn
+respawn_delay 5
+respawn_max 0
 
 depend() {
     need net localmount
@@ -887,9 +926,8 @@ ensure_mita_daemon() {
       ;;
     openrc)
       run rc-update add mita default 2>/dev/null || true
-      run rc-service mita restart 2>/dev/null || run rc-service mita start 2>/dev/null || true
-      sleep 2
-      if ! rc-service mita status 2>/dev/null | grep -q started; then
+      openrc_mita_recover
+      if ! openrc_mita_is_started; then
         mita_log_tail
       fi
       ;;
@@ -1198,8 +1236,8 @@ start_mita() {
     wait_mita_socket 10 || true
     sleep 2
   done
-  warn "$(t 'mita start 未成功，请手动执行: systemctl restart mita && mita start' \
-    'mita start failed; run: systemctl restart mita && mita start')"
+  warn "$(t "mita start 未成功，请手动执行: $(mita_restart_hint) && mita start" \
+    "mita start failed; run: $(mita_restart_hint) && mita start")"
 }
 
 verify_mita_running() {
@@ -1217,8 +1255,8 @@ verify_mita_running() {
     wait_mita_socket 10 || true
     "$bin" start 2>/dev/null || true
   done
-  warn "$(t 'mita 未处于 RUNNING 状态，请执行: systemctl restart mita && mita status && mita start' \
-    'mita is not RUNNING; run: systemctl restart mita && mita status && mita start')"
+  warn "$(t "mita 未处于 RUNNING 状态，请执行: $(mita_restart_hint) && mita status && mita start" \
+    "mita is not RUNNING; run: $(mita_restart_hint) && mita status && mita start")"
   [ -n "$status_out" ] && msg "$status_out"
 }
 
@@ -1651,17 +1689,54 @@ do_uninstall() {
 }
 
 do_status() {
-  local bin
+  local bin sm status_out recovered=0
   bin="$(mita_bin)"
+  sm="$(service_manager)"
   if ! mita_installed; then
     t 'mita 未安装' 'mita is not installed'
     exit 1
   fi
   msg ""
   "$bin" version 2>/dev/null || true
-  systemctl status mita --no-pager 2>/dev/null || rc-service mita status 2>/dev/null || true
   msg ""
-  "$bin" status 2>/dev/null || true
+  case "$sm" in
+    systemd) systemctl status mita --no-pager 2>/dev/null || true ;;
+    openrc)
+      openrc_mita_status_line
+      if openrc_mita_is_crashed; then
+        warn "$(t 'mita 处于 crashed 状态，正在自动恢复...' 'mita is crashed; auto-recovering...')"
+        openrc_mita_recover
+        recovered=1
+        openrc_mita_status_line
+      elif ! openrc_mita_is_started; then
+        warn "$(t 'mita 未运行，正在尝试启动...' 'mita is not running; trying to start...')"
+        openrc_mita_recover
+        recovered=1
+        openrc_mita_status_line
+      fi
+      ;;
+    *) true ;;
+  esac
+  msg ""
+  if ! wait_mita_socket 3; then
+    if [ "$recovered" -eq 0 ]; then
+      ensure_mita_daemon
+    fi
+    if ! wait_mita_socket 10; then
+      warn "$(t "mita 守护进程未就绪，请执行: $(mita_restart_hint)" \
+        "mita daemon not ready; run: $(mita_restart_hint)")"
+      warn "$(t "查看日志: $(mita_log_hint)" "Check logs: $(mita_log_hint)")"
+      mita_log_tail
+    fi
+  fi
+  status_out="$("$bin" status 2>/dev/null || true)"
+  if [ -n "$status_out" ]; then
+    msg "$status_out"
+  fi
+  if printf '%s' "$status_out" | grep -qi 'daemon is not running'; then
+    warn "$(t "请执行: $(mita_restart_hint)" "Run: $(mita_restart_hint)")"
+    warn "$(t "查看日志: $(mita_log_hint)" "Check logs: $(mita_log_hint)")"
+  fi
   msg ""
   "$bin" describe config 2>/dev/null || true
 }
