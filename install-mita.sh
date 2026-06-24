@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.25"
+SCRIPT_VERSION="1.2.26"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -2526,8 +2526,11 @@ menu_run_action() {
 menu_loop() {
   MENU_MODE=1
   trap - ERR
-  repair_mita_binary_paths 2>/dev/null || true
+  # 仅当已安装(或半装/损坏状态)时才做二进制修复。否则在「全新系统」上，repair_mita_binary_paths
+  # 会因找不到二进制而走 recover_deb_mita → reinstall_mita_package，在显示菜单前就「自动重下安装」mita，
+  # 随后用户选「1) 新装安装」时便被误判「检测到已安装」。修复必须放进 mita_installed 守卫内（与非交互路径一致）。
   if mita_installed; then
+    repair_mita_binary_paths 2>/dev/null || true
     ensure_management_scripts || true
     MENU_SCRIPTS_READY=1
   fi
