@@ -4,7 +4,7 @@
 # 基于 https://github.com/enfein/mieru
 set -euo pipefail
 
-SCRIPT_VERSION="1.2.26"
+SCRIPT_VERSION="1.2.27"
 SCRIPT_AUTHOR="ike"
 SCRIPT_REPO="ike-sh/mieru-OneClick"
 UPSTREAM_REPO="enfein/mieru"
@@ -1064,6 +1064,43 @@ random_port() {
   printf '%s' "$p"
 }
 
+# 取本机主用 IPv4：优先默认路由出口地址（ip route get 不发包，仅查路由表，
+# 内网无外网也可用），回退首个非回环地址。
+detect_local_ip() {
+  local ip=""
+  if command -v ip >/dev/null 2>&1; then
+    ip="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.*src \([0-9.]*\).*/\1/p' | head -n1)" || true
+  fi
+  if [ -z "$ip" ]; then
+    ip="$(hostname -I 2>/dev/null | tr ' ' '\n' \
+      | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | grep -vE '^127\.' | head -n1)" || true
+  fi
+  printf '%s' "$ip"
+}
+
+# 由本机 IP 末位八位组推导端口基数 N*100（要求 N=1-254 且基数≥1025）；不可用返回非0
+derive_port_base() {
+  local ip n base
+  ip="$(detect_local_ip)"
+  n="${ip##*.}"
+  [[ "$n" =~ ^[0-9]+$ ]] || return 1
+  [ "$n" -ge 1 ] && [ "$n" -le 254 ] || return 1
+  base=$((n * 100))
+  [ "$base" -ge 1025 ] || return 1   # 小尾号兜底：基数落入特权端口段则放弃
+  printf '%s' "$base"
+}
+
+# 在 IP 尾号端口段内随机取一个可用端口：xx01-xx99（xx00 留给 SSH）；不可用返回非0。
+# BOTH 双协议时末两位上限取 98，避免 UDP=主端口+1 溢出到 xx00 或下一机器段。
+derive_port_from_ip() {
+  local base hi off
+  base="$(derive_port_base)" || return 1
+  hi=99
+  [ "$PROTOCOL" = "BOTH" ] && hi=98
+  off=$(( (RANDOM % hi) + 1 ))
+  printf '%s' "$((base + off))"
+}
+
 valid_port() {
   local p="$1"
   [[ "$p" =~ ^[0-9]+$ ]] || return 1
@@ -1142,14 +1179,27 @@ collect_config_interactive() {
 
   msg ""
   if [ -z "$PORT" ] && [ -z "$PORT_RANGE" ]; then
-    local default_port input=""
-    default_port="$(random_port)"
+    local default_port input="" base="" localip=""
+    localip="$(detect_local_ip)"
+    if base="$(derive_port_base)"; then
+      default_port="$(derive_port_from_ip)"
+      t "检测到本机 IP ${localip}，按尾号规则端口段 $((base + 1))-$((base + 99))（${base} 留给 SSH，默认段内随机）" \
+        "Detected local IP ${localip}; by last-octet rule port range $((base + 1))-$((base + 99)) (${base} reserved for SSH, random within range)"
+    else
+      default_port="$(random_port)"
+      warn "$(t "无法按 IP 尾号推导端口（IP=${localip:-未知}，尾号过小或无法识别），回退随机端口" \
+        "Cannot derive port from IP last octet (IP=${localip:-unknown}); falling back to random port")"
+    fi
     if [ "$PROTOCOL" = "BOTH" ] && [ "$default_port" -ge 65535 ]; then
       default_port=65534
     fi
     read_tty input "$(t "监听端口 [${default_port}]: " "Listen port [${default_port}]: ")" || input=""
     PORT="${input:-$default_port}"
     valid_port "$PORT" || die "$(t '非法端口' 'Invalid port')"
+    if [ -n "$base" ] && { [ "$PORT" -lt "$((base + 1))" ] || [ "$PORT" -gt "$((base + 99))" ]; }; then
+      warn "$(t "注意：端口 ${PORT} 不在 IP 尾号段 $((base + 1))-$((base + 99)) 内，可能与按 IP 分配端口的约定冲突" \
+        "Note: port ${PORT} is outside the IP last-octet range $((base + 1))-$((base + 99)); may break the per-IP port convention")"
+    fi
   elif [ -n "$PORT" ] && [ -n "$PORT_RANGE" ]; then
     die "$(t '不能同时指定端口与端口段' 'Cannot set both port and port range')"
   fi
@@ -1356,10 +1406,20 @@ ensure_config_noninteractive() {
   [ -n "$USERNAME" ] || USERNAME="$(random_token)"
   [ -n "$PASSWORD" ] || PASSWORD="$(random_token)"
   if [ -z "$PORT" ] && [ -z "$PORT_RANGE" ]; then
-    PORT="$(random_port)"
+    if PORT="$(derive_port_from_ip)"; then
+      :
+    else
+      PORT="$(random_port)"
+    fi
   fi
   if [ -n "$PORT" ]; then
     valid_port "$PORT" || die "$(t '非法端口' 'Invalid port')"
+    local _base
+    if _base="$(derive_port_base 2>/dev/null)" \
+       && { [ "$PORT" -lt "$((_base + 1))" ] || [ "$PORT" -gt "$((_base + 99))" ]; }; then
+      warn "$(t "端口 ${PORT} 不在本机 IP 尾号段 $((_base + 1))-$((_base + 99)) 内（如非本机 IP 可忽略）" \
+        "Port ${PORT} is outside this host's IP last-octet range $((_base + 1))-$((_base + 99)) (ignore if intended)")"
+    fi
   fi
   if [ -n "$PORT_RANGE" ]; then
     valid_port_range "$PORT_RANGE" || die "$(t '非法端口段' 'Invalid port range')"
